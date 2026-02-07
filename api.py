@@ -234,7 +234,23 @@ async def get_song_detail(mid: str, quality: str = "128"):
 from fastapi.responses import StreamingResponse
 from fastapi import Body
 
-APP_PASSWORD = "admin"
+# Password management
+CONFIG_DIR = os.getenv("CONFIG_DIR", ".")
+PASSWORD_FILE = os.path.join(CONFIG_DIR, "password.txt")
+
+def load_password():
+    if os.path.exists(PASSWORD_FILE):
+        with open(PASSWORD_FILE, "r") as f:
+            return f.read().strip()
+    return "admin"  # Default password
+
+def save_password(password):
+    # Ensure config dir exists
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(PASSWORD_FILE, "w") as f:
+        f.write(password)
+
+APP_PASSWORD = load_password()
 
 @app.post("/api/auth/login")
 async def login(password: str = Body(..., embed=True)):
@@ -252,6 +268,7 @@ async def change_password(
         raise HTTPException(status_code=401, detail="Invalid current password")
     
     APP_PASSWORD = new_password
+    save_password(new_password)
     return {"status": "ok", "message": "Password updated"}
 
 # Ensure downloads directory exists
@@ -484,6 +501,38 @@ async def proxy_stream(
         media_type=media_type,
         status_code=status_code
     )
+
+
+# Serve static files (Frontend)
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+
+# Determine frontend dist path:
+# In Docker, it will be ./frontend/dist relative to app root
+# Locally, it might be ./frontend/dist if built
+FRONTEND_DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
+
+if os.path.exists(FRONTEND_DIST):
+    app.mount("/assets", StaticFiles(directory=os.path.join(FRONTEND_DIST, "assets")), name="assets")
+    
+    @app.get("/")
+    async def read_index():
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+    # Catch-all for React Router (SPA) - EXCEPT /api routes
+    # Note: This must be the last route definition
+    @app.exception_handler(404)
+    async def not_found_handler(request: Request, exc: HTTPException):
+        # If API request, return 404 JSON
+        if request.url.path.startswith("/api/"):
+            return {"detail": "Not Found"}
+        # Otherwise serve index.html for SPA routing
+        return FileResponse(os.path.join(FRONTEND_DIST, "index.html"))
+
+if __name__ == "__main__":
+    import uvicorn
+    # Use 0.0.0.0 for Docker
+    uvicorn.run(app, host="0.0.0.0", port=8001)
 
 if __name__ == "__main__":
     uvicorn.run("api:app", host="0.0.0.0", port=8001, reload=True)

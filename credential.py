@@ -14,7 +14,8 @@ from datetime import datetime
 from qqmusic_api.login import get_qrcode, check_qrcode, QRLoginType, Credential, QRCodeLoginEvents, check_expired
 
 # 配置
-CREDENTIAL_FILE = Path("qqmusic_cred.pkl")
+CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "."))
+CREDENTIAL_FILE = CONFIG_DIR / "qqmusic_cred.pkl"
 
 
 class CredentialManager:

@@ -1,0 +1,14 @@
+services:
+  app:
+    build: .
+    image: qq-music-download:latest
+    container_name: qq-music-download
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+    environment:
+      - CONFIG_DIR=/config
+      - DOWNLOAD_DIR=/downloads
+    restart: unless-stopped

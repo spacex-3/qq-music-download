@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Search, Play, Pause, Volume2, Download, Tag, Loader2, HardDrive } from 'lucide-react';
+import { Search, Play, Pause, Volume2, VolumeX, Download, Tag, Loader2, HardDrive } from 'lucide-react';
 
 
 
@@ -53,6 +53,7 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     const [currentSong, setCurrentSong] = useState<SongDetail | null>(null);
     const [isPlaying, setIsPlaying] = useState(false);
     const [volume, setVolume] = useState(0.5);
+    const [isMuted, setIsMuted] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
     const [duration, setDuration] = useState(0);
     const [page, setPage] = useState(1); // UI Page (1, 2, 3...)
@@ -249,6 +250,8 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     useEffect(() => {
         if (currentSong && audioRef.current) {
             audioRef.current.src = currentSong.url;
+            audioRef.current.volume = volume;
+            audioRef.current.muted = isMuted;
             audioRef.current.play().catch(e => console.error("Auto-play blocked", e));
 
             // Parse Lyrics
@@ -259,6 +262,18 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             }
         }
     }, [currentSong]);
+
+    useEffect(() => {
+        if (audioRef.current) {
+            audioRef.current.volume = volume;
+        }
+    }, [volume]);
+
+    useEffect(() => {
+        if (audioRef.current) {
+            audioRef.current.muted = isMuted;
+        }
+    }, [isMuted]);
 
     // Sync Lyrics
     useEffect(() => {
@@ -351,7 +366,7 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                     title="Auto-tag downloaded files with metadata"
                 >
                     <Tag className="w-4 h-4" />
-                    <span className="hidden sm:inline">Auto-Tag</span>
+                    <span className="inline text-xs sm:text-sm whitespace-nowrap">Auto-Tag</span>
                 </button>
             </div>
 
@@ -379,9 +394,13 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                                         <Play className="w-4 h-4" />
                                     </button>
                                     <button
-                                        className={`p-2 transition-colors ${downloadingMid === song.mid ? 'text-cyan-400 animate-pulse' : 'text-cyan-700 hover:text-cyan-400'}`}
+                                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded border transition-colors ${downloadingMid === song.mid
+                                            ? 'border-cyan-400 text-cyan-300 bg-cyan-500/10'
+                                            : 'border-cyan-700/40 text-cyan-500 hover:text-cyan-300 hover:border-cyan-400/70'
+                                            }`}
                                         onClick={(e) => downloadSong(e, song)}
                                         disabled={downloadingMid === song.mid}
+                                        title="下载到当前设备"
                                     >
                                         {downloadingMid === song.mid ? (
                                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -390,10 +409,13 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                                         )}
                                     </button>
                                     <button
-                                        className={`p-2 transition-colors ${savingMid === song.mid ? 'text-green-400 animate-pulse' : 'text-cyan-700 hover:text-green-400'}`}
+                                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded border transition-colors ${savingMid === song.mid
+                                            ? 'border-green-400 text-green-300 bg-green-500/10'
+                                            : 'border-cyan-700/40 text-cyan-500 hover:text-green-300 hover:border-green-400/70'
+                                            }`}
                                         onClick={(e) => saveToServer(e, song)}
                                         disabled={savingMid === song.mid}
-                                        title="Download to Server"
+                                        title="下载到服务器"
                                     >
                                         {savingMid === song.mid ? (
                                             <Loader2 className="w-4 h-4 animate-spin" />
@@ -495,21 +517,31 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                                     <span>/</span>
                                     <span>{formatTime(duration)}</span>
                                 </div>
-                                {/* Volume control - desktop only */}
-                                <div className="hidden md:flex items-center gap-2 ml-auto">
+                                {/* Volume control */}
+                                <div className="flex items-center gap-2 ml-auto">
+                                    <button
+                                        type="button"
+                                        onClick={() => setIsMuted(!isMuted)}
+                                        className="p-1 rounded border border-cyan-700/40 text-cyan-500 hover:text-cyan-300 hover:border-cyan-400/70"
+                                        title={isMuted ? "取消静音" : "静音"}
+                                    >
+                                        {isMuted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                                    </button>
                                     <Volume2 className="w-4 h-4 text-cyan-600" />
                                     <input
                                         type="range"
                                         min="0"
                                         max="1"
-                                        step="0.1"
+                                        step="0.05"
                                         value={volume}
                                         onChange={(e) => {
                                             const val = Number(e.target.value);
                                             setVolume(val);
-                                            if (audioRef.current) audioRef.current.volume = val;
+                                            if (val > 0 && isMuted) {
+                                                setIsMuted(false);
+                                            }
                                         }}
-                                        className="w-20 h-1 bg-cyan-900/30 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-cyan-600 [&::-webkit-slider-thumb]:rounded-full"
+                                        className="w-16 md:w-20 h-1 bg-cyan-900/30 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-cyan-600 [&::-webkit-slider-thumb]:rounded-full"
                                     />
                                 </div>
                             </div>

@@ -1,0 +1,25 @@
+.git
+.gitignore
+.DS_Store
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# Local runtime data
+downloads
+config
+backend.log
+qqmusic_cred.pkl
+path
+
+# Python/Node caches
+*.egg-info
+frontend/node_modules
+frontend/dist
+
+# Ignore docs/metadata not required in image
+AGENTS.md
+LICENSE
