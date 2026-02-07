@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react';
-import { Search, Play, Pause, Volume2, Download } from 'lucide-react';
+import { Search, Play, Pause, Volume2, Download, Tag, Loader2, HardDrive } from 'lucide-react';
 
 
 
@@ -58,11 +58,23 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     const [page, setPage] = useState(1); // UI Page (1, 2, 3...)
     const [apiPage, setApiPage] = useState(1); // API Page Batch (1 = items 0-20, 2 = items 21-40)
     const [quality, setQuality] = useState('flac');
+    const [autoTag, setAutoTag] = useState(() => {
+        // Load from localStorage on init
+        const saved = localStorage.getItem('autoTag');
+        return saved === 'true';
+    });
+    const [downloadingMid, setDownloadingMid] = useState<string | null>(null);
+    const [savingMid, setSavingMid] = useState<string | null>(null);
     const [parsedLyrics, setParsedLyrics] = useState<LyricLine[]>([]);
     const [activeLyricIndex, setActiveLyricIndex] = useState(0);
     const isSeekingRef = useRef(false);
     const [sliderValue, setSliderValue] = useState(0);
     const lyricContainerRef = useRef<HTMLDivElement>(null);
+
+    // Persist autoTag to localStorage
+    useEffect(() => {
+        localStorage.setItem('autoTag', autoTag.toString());
+    }, [autoTag]);
 
     const audioRef = useRef<HTMLAudioElement | null>(null);
 
@@ -166,6 +178,11 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
 
     const downloadSong = async (e: React.MouseEvent, song: SearchResult) => {
         e.stopPropagation(); // Prevent playing when clicking download
+
+        if (autoTag) {
+            setDownloadingMid(song.mid);
+        }
+
         try {
             const res = await fetch(`${API_BASE}/api/song/${song.mid}?quality=${quality}`);
             const data = await res.json();
@@ -177,12 +194,16 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
 
             // Use Proxy for Download to handle CORS headers
             const ext = quality === 'flac' || quality === 'mflac' ? 'flac' : 'mp3';
-            // Format: Title_Singer_Album.ext
             const singerName = song.singer?.[0]?.name || 'Unknown';
             const albumName = song.album?.name || 'Unknown';
             const filename = `${song.title}_${singerName}_${albumName}.${ext}`;
 
-            const proxyUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(data.url)}&download=true&name=${encodeURIComponent(filename)}`;
+            // Build proxy URL with optional autoTag params
+            let proxyUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(data.url)}&download=true&name=${encodeURIComponent(filename)}`;
+
+            if (autoTag) {
+                proxyUrl += `&mid=${song.mid}&autoTag=true`;
+            }
 
             // Trigger download via native anchor click
             const link = document.createElement('a');
@@ -193,6 +214,35 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
         } catch (error) {
             console.error(error);
             alert("Failed to download song.");
+        } finally {
+            setDownloadingMid(null);
+        }
+    };
+
+    const saveToServer = async (e: React.MouseEvent, song: SearchResult) => {
+        e.stopPropagation();
+        setSavingMid(song.mid);
+        try {
+            const res = await fetch(`${API_BASE}/api/save`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    mid: song.mid,
+                    quality: quality
+                })
+            });
+            const result = await res.json();
+
+            if (result.success) {
+                alert(`✅ Saved to Server: ${result.fileName}\nPath: ${result.filePath}`);
+            } else {
+                alert(`❌ Save failed: ${result.detail || 'Unknown error'}`);
+            }
+        } catch (error) {
+            console.error(error);
+            alert("Failed to save song to server.");
+        } finally {
+            setSavingMid(null);
         }
     };
 
@@ -290,6 +340,19 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                     <option value="flac">FLAC</option>
                     <option value="mflac">MASTER</option>
                 </select>
+
+                {/* Auto-Tag Toggle */}
+                <button
+                    onClick={() => setAutoTag(!autoTag)}
+                    className={`flex items-center gap-2 px-4 py-2 border rounded-lg font-mono transition-all ${autoTag
+                        ? 'bg-cyan-500/20 border-cyan-400 text-cyan-400 shadow-[0_0_10px_rgba(0,255,255,0.3)]'
+                        : 'bg-black/40 border-cyan-500/30 text-cyan-600 hover:border-cyan-500/50'
+                        }`}
+                    title="Auto-tag downloaded files with metadata"
+                >
+                    <Tag className="w-4 h-4" />
+                    <span className="hidden sm:inline">Auto-Tag</span>
+                </button>
             </div>
 
             {/* Main Content Area: Results + Lyrics Side-by-Side with Unified Height */}
@@ -316,10 +379,27 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                                         <Play className="w-4 h-4" />
                                     </button>
                                     <button
-                                        className="p-2 text-cyan-700 hover:text-cyan-400 transition-colors"
+                                        className={`p-2 transition-colors ${downloadingMid === song.mid ? 'text-cyan-400 animate-pulse' : 'text-cyan-700 hover:text-cyan-400'}`}
                                         onClick={(e) => downloadSong(e, song)}
+                                        disabled={downloadingMid === song.mid}
                                     >
-                                        <Download className="w-4 h-4" />
+                                        {downloadingMid === song.mid ? (
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                            <Download className="w-4 h-4" />
+                                        )}
+                                    </button>
+                                    <button
+                                        className={`p-2 transition-colors ${savingMid === song.mid ? 'text-green-400 animate-pulse' : 'text-cyan-700 hover:text-green-400'}`}
+                                        onClick={(e) => saveToServer(e, song)}
+                                        disabled={savingMid === song.mid}
+                                        title="Download to Server"
+                                    >
+                                        {savingMid === song.mid ? (
+                                            <Loader2 className="w-4 h-4 animate-spin" />
+                                        ) : (
+                                            <HardDrive className="w-4 h-4" />
+                                        )}
                                     </button>
                                 </div>
                             </div>
