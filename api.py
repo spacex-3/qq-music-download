@@ -233,6 +233,9 @@ async def get_song_detail(mid: str, quality: str = "128"):
 
 from fastapi.responses import StreamingResponse
 from fastapi import Body
+import aiohttp
+from fastapi import Request
+import tempfile
 
 # Password management
 CONFIG_DIR = os.getenv("CONFIG_DIR", ".")
@@ -257,6 +260,67 @@ async def login(password: str = Body(..., embed=True)):
     if password == APP_PASSWORD:
         return {"status": "ok"}
     raise HTTPException(status_code=401, detail="Invalid password")
+
+
+# Emby refresh configuration
+EMBY_URL = os.getenv("EMBY_URL", "").strip().rstrip("/")
+EMBY_TOKEN = os.getenv("EMBY_TOKEN", "").strip()
+EMBY_MUSIC_LIBRARY_ID = os.getenv("EMBY_MUSIC_LIBRARY_ID", "").strip()
+
+
+@app.post("/api/emby/refresh-music")
+async def refresh_emby_music_library():
+    """
+    Refresh Emby music library.
+    Prefer item/library id refresh, fallback to full library refresh.
+    """
+    if not EMBY_URL or not EMBY_TOKEN:
+        raise HTTPException(
+            status_code=400,
+            detail="Emby not configured. Please set EMBY_URL and EMBY_TOKEN."
+        )
+
+    headers = {
+        "X-Emby-Token": EMBY_TOKEN,
+        "Accept": "application/json",
+    }
+
+    # Try music library refresh first (if id is configured), then fallback.
+    candidates = []
+    if EMBY_MUSIC_LIBRARY_ID:
+        candidates.extend([
+            ("POST", f"{EMBY_URL}/Items/{EMBY_MUSIC_LIBRARY_ID}/Refresh"),
+            ("POST", f"{EMBY_URL}/emby/Items/{EMBY_MUSIC_LIBRARY_ID}/Refresh"),
+        ])
+    candidates.extend([
+        ("POST", f"{EMBY_URL}/Library/Refresh"),
+        ("POST", f"{EMBY_URL}/emby/Library/Refresh"),
+    ])
+
+    timeout = aiohttp.ClientTimeout(total=20)
+    last_error = None
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for method, url in candidates:
+            try:
+                # Send token in both header and query for broader Emby compatibility.
+                sep = "&" if "?" in url else "?"
+                url_with_key = f"{url}{sep}api_key={EMBY_TOKEN}"
+                async with session.request(method, url_with_key, headers=headers) as resp:
+                    text = await resp.text()
+                    if 200 <= resp.status < 300:
+                        return {
+                            "success": True,
+                            "strategy": "music_library" if "/Items/" in url else "full_library",
+                            "endpoint": url,
+                            "status": resp.status,
+                            "message": "Emby refresh requested successfully."
+                        }
+                    last_error = f"{url} -> HTTP {resp.status} {text[:200]}"
+            except Exception as e:
+                last_error = f"{url} -> {e}"
+
+    raise HTTPException(status_code=502, detail=f"Failed to refresh Emby: {last_error}")
 
 @app.post("/api/auth/password")
 async def change_password(
@@ -368,10 +432,6 @@ async def save_song(req: SaveRequest):
         import traceback
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
-
-import aiohttp
-from fastapi import Request
-import tempfile
 
 @app.get("/api/proxy")
 async def proxy_stream(

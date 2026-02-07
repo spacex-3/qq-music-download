@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { LoginView } from './components/LoginView'
 import { SearchPanel } from './components/SearchPanel'
-import { Loader2, Terminal, User } from 'lucide-react'
+import { Loader2, Terminal, User, RefreshCw } from 'lucide-react'
 
 // Define types locally
 interface UserInfo {
@@ -21,6 +21,7 @@ function App() {
   const [currentPass, setCurrentPass] = useState('');
   const [newPass, setNewPass] = useState('');
   const [changePassMsg, setChangePassMsg] = useState('');
+  const [refreshingLibrary, setRefreshingLibrary] = useState(false);
 
   // Use same origin to avoid cross-port/network issues behind reverse proxy/NAT
   const API_BASE = window.location.origin;
@@ -84,6 +85,25 @@ function App() {
     }
   };
 
+  const handleRefreshEmbyLibrary = async () => {
+    setRefreshingLibrary(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/emby/refresh-music`, {
+        method: 'POST'
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(`刷新失败: ${data?.detail || 'Unknown error'}`);
+        return;
+      }
+      alert('已发送 Emby 音乐库刷新请求');
+    } catch (e) {
+      alert('刷新失败: 无法连接后端');
+    } finally {
+      setRefreshingLibrary(false);
+    }
+  };
+
   useEffect(() => {
     const isAuth = localStorage.getItem('app_auth') === 'true';
     if (isAuth) {
@@ -126,9 +146,20 @@ function App() {
               </span>
             </div>
             {user && (
-              <div className="flex items-center space-x-2 text-sm text-cyan-300/70 border border-cyan-900/50 rounded-full px-3 py-1">
-                <User className="w-4 h-4" />
-                <span>{user.nickname || user.musicid || 'Unknown User'}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={handleRefreshEmbyLibrary}
+                  disabled={refreshingLibrary}
+                  className="inline-flex items-center gap-1 px-3 py-1 text-xs border border-cyan-700/50 text-cyan-300 rounded-full hover:bg-cyan-900/30 disabled:opacity-50 transition-colors"
+                  title="更新 Emby 音乐库"
+                >
+                  {refreshingLibrary ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+                  <span className="hidden sm:inline">更新音乐库</span>
+                </button>
+                <div className="flex items-center space-x-2 text-sm text-cyan-300/70 border border-cyan-900/50 rounded-full px-3 py-1">
+                  <User className="w-4 h-4" />
+                  <span>{user.nickname || user.musicid || 'Unknown User'}</span>
+                </div>
               </div>
             )}
           </div>

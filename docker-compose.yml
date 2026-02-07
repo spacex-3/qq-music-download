@@ -11,4 +11,7 @@ services:
     environment:
       - CONFIG_DIR=/config
       - DOWNLOAD_DIR=/downloads
+      - EMBY_URL=${EMBY_URL:-}
+      - EMBY_TOKEN=${EMBY_TOKEN:-}
+      - EMBY_MUSIC_LIBRARY_ID=${EMBY_MUSIC_LIBRARY_ID:-}
     restart: unless-stopped
