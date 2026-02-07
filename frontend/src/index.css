@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 240 10% 3.9%;
+    /* Mostly Dark */
+    --foreground: 0 0% 98%;
+
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+
+    --popover: 240 10% 3.9%;
+    --popover-foreground: 0 0% 98%;
+
+    --primary: 180 100% 50%;
+    /* Cyan */
+    --primary-foreground: 240 5.9% 10%;
+
+    --secondary: 320 100% 50%;
+    /* Magenta/Pink */
+    --secondary-foreground: 0 0% 98%;
+
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+
+    --accent: 180 100% 50%;
+    --accent-foreground: 240 5.9% 10%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+
+    --border: 180 100% 50%;
+    /* Cyan Border */
+    --input: 180 100% 50%;
+    --ring: 180 100% 50%;
+    /* Cyan Ring */
+
+    --radius: 0.5rem;
+
+    --chart-1: 180 100% 50%;
+    --chart-2: 320 100% 50%;
+    --chart-3: 30 100% 50%;
+    --chart-4: 280 100% 50%;
+    --chart-5: 140 100% 50%;
+  }
+
+  /* Reset body to dark */
+  body {
+    @apply bg-gray-950 text-foreground font-mono;
+  }
+}
+
+@layer border {
+  * {
+    @apply border-border;
+  }
+}
