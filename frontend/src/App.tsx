@@ -22,8 +22,8 @@ function App() {
   const [newPass, setNewPass] = useState('');
   const [changePassMsg, setChangePassMsg] = useState('');
 
-  // Dynamic API Base for mobile access
-  const API_BASE = window.location.protocol + '//' + window.location.hostname + ':8001';
+  // Use same origin to avoid cross-port/network issues behind reverse proxy/NAT
+  const API_BASE = window.location.origin;
 
   const checkUser = async () => {
     try {
