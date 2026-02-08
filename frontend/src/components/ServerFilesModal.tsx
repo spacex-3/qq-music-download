@@ -57,6 +57,7 @@ export function ServerFilesModal({ open, onClose, API_BASE }: ServerFilesModalPr
   const [volume, setVolume] = useState(0.5);
   const [isMuted, setIsMuted] = useState(false);
   const [activeLyricIndex, setActiveLyricIndex] = useState(0);
+  const [downloadingPath, setDownloadingPath] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const lyricContainerRef = useRef<HTMLDivElement>(null);
 
@@ -113,17 +114,64 @@ export function ServerFilesModal({ open, onClose, API_BASE }: ServerFilesModalPr
         return;
       }
       setCurrentInfo(data.info);
-      setStreamUrl(`${API_BASE}${data.streamUrl}`);
-      setIsPlaying(true);
+      const ext = file.path.split(".").pop()?.toLowerCase() || "";
+      const mimeByExt: Record<string, string> = {
+        mp3: "audio/mpeg",
+        m4a: "audio/mp4",
+        aac: "audio/aac",
+        wav: "audio/wav",
+        ogg: "audio/ogg",
+        opus: "audio/ogg; codecs=opus",
+        flac: "audio/flac",
+      };
+      const testAudio = document.createElement("audio");
+      const mime = mimeByExt[ext];
+      if (!mime || !testAudio.canPlayType(mime)) {
+        setStreamUrl("");
+        setIsPlaying(false);
+        alert("当前浏览器不支持该音频格式，请使用下载后本地播放器播放。");
+        return;
+      }
+      // Add a cache-buster so selecting same file can retrigger playback.
+      setStreamUrl(`${API_BASE}${data.streamUrl}${data.streamUrl.includes("?") ? "&" : "?"}t=${Date.now()}`);
       setCurrentTime(0);
       setSliderValue(0);
-      if (audioRef.current) {
-        audioRef.current.src = `${API_BASE}${data.streamUrl}`;
-        audioRef.current.play().catch(() => setIsPlaying(false));
-      }
     } catch (e) {
       console.error(e);
       alert("加载文件失败");
+    }
+  };
+
+  useEffect(() => {
+    if (!streamUrl || !audioRef.current) return;
+    audioRef.current.src = streamUrl;
+    audioRef.current.play().then(() => setIsPlaying(true)).catch((err) => {
+      console.error("auto play failed", err);
+      setIsPlaying(false);
+    });
+  }, [streamUrl]);
+
+  const downloadFile = async (file: ServerFile) => {
+    setDownloadingPath(file.path);
+    try {
+      const res = await fetch(`${API_BASE}/api/library/download?path=${encodeURIComponent(file.path)}`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = file.name || "music";
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      console.error(e);
+      alert("下载失败，请检查文件是否存在或网络连接。");
+    } finally {
+      setDownloadingPath(null);
     }
   };
 
@@ -199,13 +247,15 @@ export function ServerFilesModal({ open, onClose, API_BASE }: ServerFilesModalPr
                     >
                       <Play className="w-4 h-4" />
                     </button>
-                    <a
-                      href={`${API_BASE}/api/library/download?path=${encodeURIComponent(file.path)}`}
-                      className="p-2 text-cyan-500 hover:text-cyan-300"
+                    <button
+                      type="button"
+                      onClick={() => downloadFile(file)}
+                      className="p-2 text-cyan-500 hover:text-cyan-300 disabled:opacity-40"
                       title="下载"
+                      disabled={downloadingPath === file.path}
                     >
                       <Download className="w-4 h-4" />
-                    </a>
+                    </button>
                   </div>
                 </div>
               ))}
@@ -316,6 +366,11 @@ export function ServerFilesModal({ open, onClose, API_BASE }: ServerFilesModalPr
               src={streamUrl}
               onTimeUpdate={onTimeUpdate}
               onEnded={() => setIsPlaying(false)}
+              onError={() => {
+                const msg = audioRef.current?.error?.message || "音频格式或流读取失败";
+                setIsPlaying(false);
+                alert(`播放失败: ${msg}`);
+              }}
               preload="auto"
               playsInline
             />

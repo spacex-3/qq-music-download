@@ -20,6 +20,7 @@ interface SongDetail {
     title: string;
     singer: string;
     cover: string;
+    source?: "local" | "remote";
 }
 
 interface LyricLine {
@@ -79,6 +80,23 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     }, [autoTag]);
 
     const audioRef = useRef<HTMLAudioElement | null>(null);
+
+    const canPlayLocalPath = (path: string): boolean => {
+        const ext = path.split('.').pop()?.toLowerCase() || "";
+        const mimeByExt: Record<string, string> = {
+            mp3: "audio/mpeg",
+            m4a: "audio/mp4",
+            aac: "audio/aac",
+            wav: "audio/wav",
+            ogg: "audio/ogg",
+            opus: "audio/ogg; codecs=opus",
+            flac: "audio/flac",
+        };
+        const mime = mimeByExt[ext];
+        if (!mime) return false;
+        const audio = document.createElement("audio");
+        return !!audio.canPlayType(mime);
+    };
 
     const annotateLocalMatches = async (songs: SearchResult[]): Promise<SearchResult[]> => {
         if (!songs.length) return songs;
@@ -167,6 +185,47 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     // Calculate displayed results based on page
     const displayedResults = allResults.slice((page - 1) * 5, page * 5);
 
+    const playRemoteSong = async (song: SearchResult) => {
+        const mid = song.mid;
+        const title = song.title;
+        const singer = song.singer?.[0]?.name || "Unknown";
+        try {
+            const res = await fetch(`${API_BASE}/api/song/${mid}?quality=${quality}`);
+            const data = await res.json();
+
+            if (!data.url) {
+                alert("Playback failed: VIP or restricted song.");
+                return false;
+            }
+
+            const ext = (quality === 'flac' || quality === 'mflac') ? 'flac' : 'mp3';
+            const proxyName = `${title}.${ext}`;
+            const proxyUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(data.url)}&name=${encodeURIComponent(proxyName)}`;
+
+            setCurrentSong({
+                mid: data.mid,
+                url: proxyUrl,
+                lyric: data.lyric,
+                trans: data.trans,
+                title: title,
+                singer: singer,
+                cover: `https://y.gtimg.cn/music/photo_new/T002R300x300M000${data.mid}.jpg`,
+                source: "remote",
+            });
+
+            const foundAction = allResults.find(r => r.mid === mid);
+            if (foundAction && foundAction.album?.mid) {
+                setCurrentSong(prev => prev ? ({ ...prev, cover: `https://y.gtimg.cn/music/photo_new/T002R300x300M000${foundAction.album.mid}.jpg` }) : null);
+            }
+            setIsPlaying(true);
+            return true;
+        } catch (error) {
+            console.error(error);
+            alert("Failed to load song.");
+            return false;
+        }
+    };
+
     const playLocalFile = async (song: SearchResult) => {
         if (!song.localPath) return false;
         try {
@@ -183,6 +242,7 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                 title: info.title || song.title,
                 singer: info.artist || song.singer?.[0]?.name || "Unknown",
                 cover: info.cover || `https://y.gtimg.cn/music/photo_new/T002R300x300M000${song.album?.mid || song.mid}.jpg`,
+                source: "local",
             });
             setIsPlaying(true);
             return true;
@@ -193,49 +253,11 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     };
 
     const playSong = async (song: SearchResult) => {
-        const usedLocal = await playLocalFile(song);
-        if (usedLocal) return;
-        const mid = song.mid;
-        const title = song.title;
-        const singer = song.singer?.[0]?.name || "Unknown";
-        try {
-            // Get song details (url + lyrics)
-            const res = await fetch(`${API_BASE}/api/song/${mid}?quality=${quality}`);
-            const data = await res.json();
-
-            if (!data.url) {
-                alert("Playback failed: VIP or restricted song.");
-                return;
-            }
-
-            // Determine extension based on quality for correct MIME type
-            const ext = (quality === 'flac' || quality === 'mflac') ? 'flac' : 'mp3';
-            const proxyName = `${title}.${ext}`;
-
-            // Use proxy to avoid CORS/Referer issues
-            const proxyUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(data.url)}&name=${encodeURIComponent(proxyName)}`;
-
-            setCurrentSong({
-                mid: data.mid,
-                url: proxyUrl, // data.url replaced by proxy
-                lyric: data.lyric,
-                trans: data.trans,
-                title: title,
-                singer: singer,
-                cover: `https://y.gtimg.cn/music/photo_new/T002R300x300M000${data.mid}.jpg`
-            });
-
-            // If we have search result context, try to use album image
-            const foundAction = allResults.find(r => r.mid === mid);
-            if (foundAction && foundAction.album?.mid) {
-                setCurrentSong(prev => prev ? ({ ...prev, cover: `https://y.gtimg.cn/music/photo_new/T002R300x300M000${foundAction.album.mid}.jpg` }) : null);
-            }
-
-            setIsPlaying(true);
-        } catch (error) {
-            console.error(error);
-            alert("Failed to load song.");
+        if (song.localPath && canPlayLocalPath(song.localPath)) {
+            const usedLocal = await playLocalFile(song);
+            if (usedLocal) return;
         }
+        await playRemoteSong(song);
     };
 
     const downloadSong = async (e: React.MouseEvent, song: SearchResult) => {
@@ -247,11 +269,19 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
 
         try {
             if (song.localPath) {
+                const dlRes = await fetch(`${API_BASE}/api/library/download?path=${encodeURIComponent(song.localPath)}`);
+                if (!dlRes.ok) {
+                    throw new Error(`Local download failed: HTTP ${dlRes.status}`);
+                }
+                const blob = await dlRes.blob();
+                const blobUrl = URL.createObjectURL(blob);
                 const link = document.createElement('a');
-                link.href = `${API_BASE}/api/library/download?path=${encodeURIComponent(song.localPath)}`;
+                link.href = blobUrl;
+                link.download = song.localPath.split('/').pop() || `${song.title}.flac`;
                 document.body.appendChild(link);
                 link.click();
                 document.body.removeChild(link);
+                URL.revokeObjectURL(blobUrl);
                 return;
             }
 
@@ -284,7 +314,8 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             document.body.removeChild(link);
         } catch (error) {
             console.error(error);
-            alert("Failed to download song.");
+            console.error("downloadSong failed:", error);
+            alert(`Failed to download song: ${error instanceof Error ? error.message : "Unknown error"}`);
         } finally {
             setDownloadingMid(null);
         }
@@ -650,7 +681,17 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                             onEnded={() => setIsPlaying(false)}
                             onError={(e) => {
                                 console.error("Audio Playback Error:", e);
-                                alert(`Playback Error: ${audioRef.current?.error?.message || 'Unknown code ' + audioRef.current?.error?.code}`);
+                                const code = audioRef.current?.error?.code;
+                                const msg = audioRef.current?.error?.message || 'Unknown code ' + code;
+                                if (currentSong?.source === "local") {
+                                    const fallbackSong = allResults.find(r => r.mid === currentSong.mid);
+                                    if (fallbackSong) {
+                                        console.warn("Local playback failed, fallback to remote source.", msg);
+                                        playRemoteSong(fallbackSong);
+                                        return;
+                                    }
+                                }
+                                alert(`Playback Error: ${msg}`);
                                 setIsPlaying(false);
                             }}
                             preload="auto"

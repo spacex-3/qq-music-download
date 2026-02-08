@@ -347,7 +347,8 @@ AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
 
 
 def _normalize_text(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+    # Keep unicode letters/numbers (including CJK), strip separators.
+    return re.sub(r"[\s\-_.,，。·:：()（）\[\]【】]+", "", (value or "").lower())
 
 
 def _safe_rel_to_abs(rel_path: str) -> str:
@@ -455,14 +456,45 @@ def _iter_audio_files():
             yield abs_path, rel_path
 
 
+def _strict_filename_match(basename: str, title: str, singer: str, album: str) -> bool:
+    """
+    Strictly match filename in pattern: title_singer_album.ext
+    Supports ambiguous underscores by trying all split positions.
+    """
+    target_title = _normalize_text(title)
+    target_singer = _normalize_text(singer)
+    target_album = _normalize_text(album)
+    if not target_title or not target_singer or not target_album:
+        return False
+
+    stem = os.path.splitext(basename)[0]
+    parts = stem.split("_")
+    if len(parts) < 3:
+        return False
+
+    # Try all partitions: [0:i] [i:j] [j:n]
+    n = len(parts)
+    for i in range(1, n - 1):
+        for j in range(i + 1, n):
+            p_title = _normalize_text("_".join(parts[:i]))
+            p_singer = _normalize_text("_".join(parts[i:j]))
+            p_album = _normalize_text("_".join(parts[j:]))
+            if p_title == target_title and p_singer == target_singer and p_album == target_album:
+                return True
+    return False
+
+
 @app.get("/api/library/files")
 async def list_library_files(q: str = "", limit: int = 200):
     limit = max(1, min(limit, 1000))
+    q_raw = (q or "").strip().lower()
     q_norm = _normalize_text(q)
     files = []
     for abs_path, rel_path in _iter_audio_files():
         name = os.path.basename(abs_path)
-        if q_norm and q_norm not in _normalize_text(name):
+        name_raw = name.lower()
+        name_norm = _normalize_text(name)
+        if q_raw and q_raw not in name_raw and (not q_norm or q_norm not in name_norm):
             continue
         st = os.stat(abs_path)
         files.append({
@@ -488,31 +520,21 @@ class MatchRequest(BaseModel):
 
 @app.post("/api/library/find-matches")
 async def find_library_matches(req: MatchRequest):
-    indexed_files = []
-    for abs_path, rel_path in _iter_audio_files():
-        basename = os.path.basename(abs_path)
-        indexed_files.append((abs_path, rel_path, _normalize_text(basename)))
-
     result = {}
     for song in req.songs:
-        title_norm = _normalize_text(song.title)
-        singer_norm = _normalize_text(song.singer)
-        album_norm = _normalize_text(song.album)
+        if not song.title or not song.singer or not song.album:
+            continue
 
-        best = None
-        for _, rel_path, name_norm in indexed_files:
-            if title_norm and title_norm not in name_norm:
-                continue
-            if singer_norm and singer_norm not in name_norm:
-                continue
-            score = 0
-            if album_norm and album_norm in name_norm:
-                score += 1
-            score += max(0, 1000 - abs(len(name_norm) - (len(title_norm) + len(singer_norm))))
-            if not best or score > best["score"]:
-                best = {"path": rel_path, "score": score}
-        if best:
-            result[song.mid] = {"path": best["path"]}
+        for abs_path, rel_path in _iter_audio_files():
+            basename = os.path.basename(abs_path)
+            if _strict_filename_match(
+                basename=basename,
+                title=song.title,
+                singer=song.singer,
+                album=song.album,
+            ):
+                result[song.mid] = {"path": rel_path}
+                break
     return {"matches": result}
 
 
