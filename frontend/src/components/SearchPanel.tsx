@@ -9,6 +9,7 @@ interface SearchResult {
     singer: { name: string }[];
     album: { name: string; mid: string };
     interval: number;
+    localPath?: string;
 }
 
 interface SongDetail {
@@ -79,6 +80,35 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
 
     const audioRef = useRef<HTMLAudioElement | null>(null);
 
+    const annotateLocalMatches = async (songs: SearchResult[]): Promise<SearchResult[]> => {
+        if (!songs.length) return songs;
+        try {
+            const payload = {
+                songs: songs.map((song) => ({
+                    mid: song.mid,
+                    title: song.title,
+                    singer: song.singer?.[0]?.name || "",
+                    album: song.album?.name || "",
+                })),
+            };
+            const res = await fetch(`${API_BASE}/api/library/find-matches`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload),
+            });
+            if (!res.ok) return songs;
+            const data = await res.json();
+            const matches = data?.matches || {};
+            return songs.map((song) => ({
+                ...song,
+                localPath: matches[song.mid]?.path || undefined,
+            }));
+        } catch (e) {
+            console.error("match local files failed", e);
+            return songs;
+        }
+    };
+
     const handleSearchStart = async () => {
         if (!keyword.trim()) return;
         setLoading(true);
@@ -89,7 +119,8 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             // Fetch first 20 items
             const res = await fetch(`${API_BASE}/api/search?keyword=${encodeURIComponent(keyword)}&limit=20&page=1`);
             const data = await res.json();
-            setAllResults(data.list || []);
+            const withLocal = await annotateLocalMatches(data.list || []);
+            setAllResults(withLocal);
         } catch (error) {
             console.error(error);
         } finally {
@@ -104,7 +135,7 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             console.log(`Fetching more results batch ${nextApiPage}...`);
             const res = await fetch(`${API_BASE}/api/search?keyword=${encodeURIComponent(keyword)}&limit=20&page=${nextApiPage}`);
             const data = await res.json();
-            const newResults = data.list || [];
+            const newResults = await annotateLocalMatches(data.list || []);
 
             if (newResults.length > 0) {
                 setAllResults(prev => [...prev, ...newResults]);
@@ -136,7 +167,37 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     // Calculate displayed results based on page
     const displayedResults = allResults.slice((page - 1) * 5, page * 5);
 
-    const playSong = async (mid: string, title: string, singer: string) => {
+    const playLocalFile = async (song: SearchResult) => {
+        if (!song.localPath) return false;
+        try {
+            const res = await fetch(`${API_BASE}/api/library/file-info?path=${encodeURIComponent(song.localPath)}`);
+            if (!res.ok) return false;
+            const data = await res.json();
+            const info = data?.info;
+            if (!info) return false;
+            setCurrentSong({
+                mid: song.mid,
+                url: `${API_BASE}${data.streamUrl}`,
+                lyric: info.lyric || "",
+                trans: "",
+                title: info.title || song.title,
+                singer: info.artist || song.singer?.[0]?.name || "Unknown",
+                cover: info.cover || `https://y.gtimg.cn/music/photo_new/T002R300x300M000${song.album?.mid || song.mid}.jpg`,
+            });
+            setIsPlaying(true);
+            return true;
+        } catch (e) {
+            console.error("play local file failed", e);
+            return false;
+        }
+    };
+
+    const playSong = async (song: SearchResult) => {
+        const usedLocal = await playLocalFile(song);
+        if (usedLocal) return;
+        const mid = song.mid;
+        const title = song.title;
+        const singer = song.singer?.[0]?.name || "Unknown";
         try {
             // Get song details (url + lyrics)
             const res = await fetch(`${API_BASE}/api/song/${mid}?quality=${quality}`);
@@ -185,6 +246,15 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
         }
 
         try {
+            if (song.localPath) {
+                const link = document.createElement('a');
+                link.href = `${API_BASE}/api/library/download?path=${encodeURIComponent(song.localPath)}`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                return;
+            }
+
             const res = await fetch(`${API_BASE}/api/song/${song.mid}?quality=${quality}`);
             const data = await res.json();
 
@@ -379,14 +449,14 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                             <div
                                 key={song.mid}
                                 className="group flex items-center justify-between p-3 mb-2 bg-black/40 border border-cyan-900/30 rounded hover:bg-cyan-900/20 hover:border-cyan-500/50 transition-all cursor-pointer"
-                                onClick={() => playSong(song.mid, song.title, song.singer?.[0]?.name || 'Unknown')}
+                                onClick={() => playSong(song)}
                             >
                                 <div className="flex flex-col overflow-hidden min-w-0 mr-4">
                                     <span className="text-cyan-100 font-medium truncate group-hover:text-cyan-400 transition-colors">
                                         {song.title}
                                     </span>
                                     <span className="text-xs text-cyan-600 truncate">
-                                        {song.singer?.[0]?.name} · {song.album?.name}
+                                        {song.singer?.[0]?.name} · {song.album?.name}{song.localPath ? " · LOCAL" : ""}
                                     </span>
                                 </div>
                                 <div className="flex items-center gap-2 shrink-0">

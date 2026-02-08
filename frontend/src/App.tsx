@@ -1,7 +1,8 @@
 import { useState, useEffect } from 'react'
 import { LoginView } from './components/LoginView'
 import { SearchPanel } from './components/SearchPanel'
-import { Loader2, Terminal, User, RefreshCw } from 'lucide-react'
+import { ServerFilesModal } from './components/ServerFilesModal'
+import { Loader2, Terminal, User, RefreshCw, Library } from 'lucide-react'
 
 // Define types locally
 interface UserInfo {
@@ -22,6 +23,7 @@ function App() {
   const [newPass, setNewPass] = useState('');
   const [changePassMsg, setChangePassMsg] = useState('');
   const [refreshingLibrary, setRefreshingLibrary] = useState(false);
+  const [showServerFiles, setShowServerFiles] = useState(false);
 
   // Use same origin to avoid cross-port/network issues behind reverse proxy/NAT
   const API_BASE = window.location.origin;
@@ -147,6 +149,14 @@ function App() {
             </div>
             {user && (
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowServerFiles(true)}
+                  className="inline-flex items-center gap-1 px-3 py-1 text-xs border border-cyan-700/50 text-cyan-300 rounded-full hover:bg-cyan-900/30 transition-colors"
+                  title="服务器文件列表"
+                >
+                  <Library className="w-3 h-3" />
+                  <span className="hidden sm:inline">服务器文件</span>
+                </button>
                 <button
                   onClick={handleRefreshEmbyLibrary}
                   disabled={refreshingLibrary}
@@ -297,6 +307,12 @@ function App() {
       <footer className="py-6 text-center text-xs text-gray-600 font-mono border-t border-cyan-900/10">
         SYS.VER.2.0.1 // CONNECTED
       </footer>
+
+      <ServerFilesModal
+        open={showServerFiles}
+        onClose={() => setShowServerFiles(false)}
+        API_BASE={API_BASE}
+      />
     </div>
   )
 }

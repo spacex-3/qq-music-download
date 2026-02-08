@@ -9,6 +9,8 @@ import uvicorn
 from contextlib import asynccontextmanager
 import uuid
 import os
+import mimetypes
+import re
 
 # Import from existing modules
 import sys
@@ -236,6 +238,8 @@ from fastapi import Body
 import aiohttp
 from fastapi import Request
 import tempfile
+from urllib.parse import quote
+from mutagen import File as MutagenFile
 
 # Password management
 CONFIG_DIR = os.getenv("CONFIG_DIR", ".")
@@ -338,6 +342,229 @@ async def change_password(
 # Ensure downloads directory exists
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
+
+
+def _normalize_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+def _safe_rel_to_abs(rel_path: str) -> str:
+    if not rel_path:
+        raise HTTPException(status_code=400, detail="path is required")
+    base = os.path.realpath(DOWNLOAD_DIR)
+    target = os.path.realpath(os.path.join(base, rel_path))
+    if not target.startswith(base + os.sep) and target != base:
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not os.path.isfile(target):
+        raise HTTPException(status_code=404, detail="file not found")
+    return target
+
+
+def _extract_lyrics(audio) -> str:
+    if not audio or not getattr(audio, "tags", None):
+        return ""
+    tags = audio.tags
+    # FLAC/Vorbis style
+    for key in ("LYRICS", "UNSYNCEDLYRICS", "USLT"):
+        value = tags.get(key)
+        if value:
+            if isinstance(value, list):
+                return str(value[0])
+            return str(value)
+    # ID3 style
+    for key in tags.keys():
+        if key.startswith("USLT"):
+            frame = tags.get(key)
+            text = getattr(frame, "text", "")
+            if isinstance(text, list):
+                return str(text[0]) if text else ""
+            return str(text)
+    return ""
+
+
+def _extract_cover_data_url(audio, ext: str) -> str:
+    if not audio:
+        return ""
+    image_data = None
+    mime = "image/jpeg"
+    if ext == ".flac":
+        pictures = getattr(audio, "pictures", None) or []
+        if pictures:
+            image_data = pictures[0].data
+            mime = pictures[0].mime or mime
+    else:
+        tags = getattr(audio, "tags", None)
+        if tags:
+            for key in tags.keys():
+                if key.startswith("APIC"):
+                    frame = tags.get(key)
+                    image_data = getattr(frame, "data", None)
+                    mime = getattr(frame, "mime", mime) or mime
+                    if image_data:
+                        break
+    if not image_data:
+        return ""
+    return f"data:{mime};base64,{base64.b64encode(image_data).decode('utf-8')}"
+
+
+def _extract_audio_info(abs_path: str, rel_path: str):
+    name = os.path.basename(abs_path)
+    ext = os.path.splitext(name)[1].lower()
+    stat = os.stat(abs_path)
+    info = {
+        "name": name,
+        "path": rel_path,
+        "size": stat.st_size,
+        "mtime": int(stat.st_mtime),
+        "title": os.path.splitext(name)[0],
+        "artist": "",
+        "album": "",
+        "lyric": "",
+        "cover": "",
+    }
+    try:
+        audio = MutagenFile(abs_path)
+        if audio and getattr(audio, "tags", None):
+            tags = audio.tags
+            title = tags.get("TIT2") or tags.get("TITLE")
+            artist = tags.get("TPE1") or tags.get("ARTIST")
+            album = tags.get("TALB") or tags.get("ALBUM")
+            if title:
+                info["title"] = str(title[0] if isinstance(title, list) else getattr(title, "text", [info["title"]])[0])
+            if artist:
+                info["artist"] = str(artist[0] if isinstance(artist, list) else getattr(artist, "text", [""])[0])
+            if album:
+                info["album"] = str(album[0] if isinstance(album, list) else getattr(album, "text", [""])[0])
+            info["lyric"] = _extract_lyrics(audio)
+            info["cover"] = _extract_cover_data_url(audio, ext)
+    except Exception as e:
+        print(f"read audio metadata failed for {abs_path}: {e}", file=sys.stderr)
+    return info
+
+
+def _iter_audio_files():
+    for root, _, files in os.walk(DOWNLOAD_DIR):
+        for filename in files:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext not in AUDIO_EXTENSIONS:
+                continue
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, DOWNLOAD_DIR)
+            yield abs_path, rel_path
+
+
+@app.get("/api/library/files")
+async def list_library_files(q: str = "", limit: int = 200):
+    limit = max(1, min(limit, 1000))
+    q_norm = _normalize_text(q)
+    files = []
+    for abs_path, rel_path in _iter_audio_files():
+        name = os.path.basename(abs_path)
+        if q_norm and q_norm not in _normalize_text(name):
+            continue
+        st = os.stat(abs_path)
+        files.append({
+            "name": name,
+            "path": rel_path,
+            "size": st.st_size,
+            "mtime": int(st.st_mtime),
+        })
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return {"list": files[:limit], "total": len(files)}
+
+
+class MatchSong(BaseModel):
+    mid: str
+    title: str
+    singer: str = ""
+    album: str = ""
+
+
+class MatchRequest(BaseModel):
+    songs: list[MatchSong]
+
+
+@app.post("/api/library/find-matches")
+async def find_library_matches(req: MatchRequest):
+    indexed_files = []
+    for abs_path, rel_path in _iter_audio_files():
+        basename = os.path.basename(abs_path)
+        indexed_files.append((abs_path, rel_path, _normalize_text(basename)))
+
+    result = {}
+    for song in req.songs:
+        title_norm = _normalize_text(song.title)
+        singer_norm = _normalize_text(song.singer)
+        album_norm = _normalize_text(song.album)
+
+        best = None
+        for _, rel_path, name_norm in indexed_files:
+            if title_norm and title_norm not in name_norm:
+                continue
+            if singer_norm and singer_norm not in name_norm:
+                continue
+            score = 0
+            if album_norm and album_norm in name_norm:
+                score += 1
+            score += max(0, 1000 - abs(len(name_norm) - (len(title_norm) + len(singer_norm))))
+            if not best or score > best["score"]:
+                best = {"path": rel_path, "score": score}
+        if best:
+            result[song.mid] = {"path": best["path"]}
+    return {"matches": result}
+
+
+@app.get("/api/library/file-info")
+async def library_file_info(path: str):
+    abs_path = _safe_rel_to_abs(path)
+    rel_path = os.path.relpath(abs_path, DOWNLOAD_DIR)
+    info = _extract_audio_info(abs_path, rel_path)
+    stream_url = f"/api/library/stream?path={quote(rel_path)}"
+    download_url = f"/api/library/download?path={quote(rel_path)}"
+    return {
+        "success": True,
+        "info": info,
+        "streamUrl": stream_url,
+        "downloadUrl": download_url,
+    }
+
+
+def _guess_media_type(path: str):
+    media_type = mimetypes.guess_type(path)[0]
+    if media_type:
+        return media_type
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".flac":
+        return "audio/flac"
+    if ext == ".mp3":
+        return "audio/mpeg"
+    return "application/octet-stream"
+
+
+@app.get("/api/library/stream")
+async def stream_library_file(path: str):
+    abs_path = _safe_rel_to_abs(path)
+    return FileResponse(
+        abs_path,
+        media_type=_guess_media_type(abs_path),
+        headers={"Accept-Ranges": "bytes"},
+    )
+
+
+@app.get("/api/library/download")
+async def download_library_file(path: str):
+    abs_path = _safe_rel_to_abs(path)
+    filename = os.path.basename(abs_path)
+    return FileResponse(
+        abs_path,
+        media_type=_guess_media_type(abs_path),
+        filename=filename,
+        headers={
+            "Accept-Ranges": "bytes",
+        },
+    )
 
 class SaveRequest(BaseModel):
     mid: str
