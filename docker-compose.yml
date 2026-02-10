@@ -1,7 +1,6 @@
 services:
   app:
-    build: .
-    image: qq-music-download:latest
+    image: ghcr.io/spacex-3/qqmusicdownloader:latest
     container_name: qq-music-download
     ports:
       - "8001:8001"
