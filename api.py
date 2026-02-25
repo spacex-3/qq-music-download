@@ -379,16 +379,20 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"[\s\-_.,，。·:：()（）\[\]【】]+", "", (value or "").lower())
 
 
-def _safe_rel_to_abs(rel_path: str) -> str:
+def _safe_rel_to_abs_under_base(rel_path: str, base_dir: str) -> str:
     if not rel_path:
         raise HTTPException(status_code=400, detail="path is required")
-    base = os.path.realpath(DOWNLOAD_DIR)
+    base = os.path.realpath(base_dir)
     target = os.path.realpath(os.path.join(base, rel_path))
     if not target.startswith(base + os.sep) and target != base:
         raise HTTPException(status_code=400, detail="invalid path")
     if not os.path.isfile(target):
         raise HTTPException(status_code=404, detail="file not found")
     return target
+
+
+def _safe_rel_to_abs(rel_path: str) -> str:
+    return _safe_rel_to_abs_under_base(rel_path, DOWNLOAD_DIR)
 
 
 def _extract_lyrics(audio) -> str:
@@ -473,14 +477,14 @@ def _extract_audio_info(abs_path: str, rel_path: str):
     return info
 
 
-def _iter_audio_files():
-    for root, _, files in os.walk(DOWNLOAD_DIR):
+def _iter_audio_files(base_dir: str = DOWNLOAD_DIR):
+    for root, _, files in os.walk(base_dir):
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
             if ext not in AUDIO_EXTENSIONS:
                 continue
             abs_path = os.path.join(root, filename)
-            rel_path = os.path.relpath(abs_path, DOWNLOAD_DIR)
+            rel_path = os.path.relpath(abs_path, base_dir)
             yield abs_path, rel_path
 
 
@@ -606,6 +610,61 @@ async def stream_library_file(path: str):
 @app.get("/api/library/download")
 async def download_library_file(path: str):
     abs_path = _safe_rel_to_abs(path)
+    filename = os.path.basename(abs_path)
+    return FileResponse(
+        abs_path,
+        media_type=_guess_media_type(abs_path),
+        filename=filename,
+        headers={
+            "Accept-Ranges": "bytes",
+        },
+    )
+
+
+@app.get("/api/batch-files")
+async def list_batch_files(q: str = "", limit: int = 500):
+    """
+    List temporary browser-batch files under /tmp/qq_playlist_zip_chunks.
+    Includes both zipped chunks and staged audio files.
+    """
+    _cleanup_old_zip_sessions()
+    limit = max(1, min(limit, 2000))
+    q_raw = (q or "").strip().lower()
+    q_norm = _normalize_text(q)
+
+    files = []
+    for root, _, filenames in os.walk(PLAYLIST_ZIP_ROOT):
+        for filename in filenames:
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, PLAYLIST_ZIP_ROOT)
+            name_raw = filename.lower()
+            name_norm = _normalize_text(filename)
+            if q_raw and q_raw not in name_raw and (not q_norm or q_norm not in name_norm):
+                continue
+            try:
+                st = os.stat(abs_path)
+                files.append({
+                    "name": filename,
+                    "path": rel_path,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                })
+            except FileNotFoundError:
+                continue
+
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return {
+        "list": files[:limit],
+        "total": len(files),
+        "ttlSeconds": PLAYLIST_ZIP_TTL_SECONDS,
+        "root": PLAYLIST_ZIP_ROOT,
+    }
+
+
+@app.get("/api/batch-files/download")
+async def download_batch_file(path: str):
+    _cleanup_old_zip_sessions()
+    abs_path = _safe_rel_to_abs_under_base(path, PLAYLIST_ZIP_ROOT)
     filename = os.path.basename(abs_path)
     return FileResponse(
         abs_path,
