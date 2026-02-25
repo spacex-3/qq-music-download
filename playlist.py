@@ -17,7 +17,7 @@ import logging
 import aiohttp
 from qqmusic_api import search
 from qqmusic_api.song import get_song_urls, SongFileType
-from qqmusic_api.songlist import get_song_list
+from qqmusic_api.songlist import get_songlist, get_detail
 from qqmusic_api.login import Credential
 
 from song import QQMusicSingleDownloader, Config as SongConfig, SongInfo, DownloadError
@@ -133,20 +133,21 @@ class PlaylistDownloader:
         使用 qqmusic_api 获取歌单信息
         """
         try:
-            # 获取歌单详情
-            result = await get_song_list(playlist_id, credential=self.credential)
+            songlist_id = int(playlist_id)
+            # 获取歌单详情（基础信息）
+            detail = await get_detail(songlist_id=songlist_id, num=1, onlysong=False)
+            # 获取完整歌曲列表
+            song_list = await get_songlist(songlist_id=songlist_id)
             
             # 解析歌单基本信息
-            dirinfo = result.get('dirinfo', {})
+            dirinfo = detail.get('dirinfo', {})
             name = dirinfo.get('title', 'Unknown Playlist')
-            creator = dirinfo.get('creator', {}).get('name', 'Unknown')
+            creator = dirinfo.get('host_nick', 'Unknown')
             description = dirinfo.get('desc', '')
             cover_url = dirinfo.get('picurl', '')
             
             # 解析歌曲列表
             songs = []
-            song_list = result.get('songlist', [])
-            
             for song_data in song_list:
                 try:
                     song_info = self._parse_song_data(song_data)
@@ -256,18 +257,28 @@ class PlaylistDownloader:
             try:
                 # 使用信号量控制并发
                 async with self.download_semaphore:
-                    success = await self._download_single_song(
+                    status = await self._download_single_song(
                         song, playlist_dir, quality
                     )
                     
-                    if success:
+                    if status == "success":
                         success_count += 1
                         if progress_callback:
                             progress_callback(index + 1, total, song.name, "success")
-                    else:
+                    elif status == "skip":
                         skip_count += 1
                         if progress_callback:
                             progress_callback(index + 1, total, song.name, "skip")
+                    else:
+                        fail_count += 1
+                        failed_songs.append({
+                            'name': song.name,
+                            'singer': song.singer,
+                            'mid': song.mid,
+                            'error': 'download returned false'
+                        })
+                        if progress_callback:
+                            progress_callback(index + 1, total, song.name, "failed")
                 
                 # 反检测：随机延迟
                 if index < total - 1:  # 不是最后一首
@@ -310,8 +321,8 @@ class PlaylistDownloader:
         song: SongInfo,
         output_dir: Path,
         quality: str
-    ) -> bool:
-        """下载单首歌曲"""
+    ) -> str:
+        """下载单首歌曲: return success|skip|failed"""
         try:
             # 检查是否已存在
             safe_name = self._sanitize_filename(f"{song.singer} - {song.name}")
@@ -321,7 +332,7 @@ class PlaylistDownloader:
                 existing_file = output_dir / f"{safe_name}{ext}"
                 if existing_file.exists() and existing_file.stat().st_size > 1024:
                     logger.info(f"歌曲已存在，跳过: {song.name}")
-                    return False  # 已存在，算作skip
+                    return "skip"
             
             # 构建 song_data 格式供 QQMusicSingleDownloader 使用
             song_data = {
@@ -341,11 +352,11 @@ class PlaylistDownloader:
             # 下载
             result = await self.song_downloader.download_song(song_data)
             
-            return result
+            return "success" if result else "failed"
             
         except Exception as e:
             logger.error(f"下载歌曲出错 [{song.name}]: {e}")
-            return False
+            return "failed"
     
     async def _random_delay(self):
         """随机延迟，模拟人类行为"""
@@ -429,7 +440,7 @@ class StreamingPlaylistDownloader(PlaylistDownloader):
                 
                 try:
                     async with self.download_semaphore:
-                        success = await self._download_single_song(
+                        status = await self._download_single_song(
                             song, playlist_dir, quality
                         )
                         
@@ -439,7 +450,7 @@ class StreamingPlaylistDownloader(PlaylistDownloader):
                             'total': total,
                             'song_name': song.name,
                             'singer': song.singer,
-                            'status': 'success' if success else 'skip'
+                            'status': status
                         }
                     
                     # 反检测延迟
