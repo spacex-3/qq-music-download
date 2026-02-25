@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-from typing import Optional
+from typing import Optional, List, Dict
 import base64
 from io import BytesIO
 import uvicorn
@@ -11,6 +11,8 @@ import uuid
 import os
 import mimetypes
 import re
+import json
+from pathlib import Path
 
 # Import from existing modules
 import sys
@@ -811,6 +813,234 @@ async def proxy_stream(
         status_code=status_code
     )
 
+
+# ==================== Playlist Download Endpoints ====================
+
+from pydantic import BaseModel, Field
+from typing import Literal
+from playlist import (
+    PlaylistParser, 
+    PlaylistDownloader, 
+    StreamingPlaylistDownloader,
+    download_qq_playlist,
+    AntiDetectionConfig
+)
+
+class PlaylistParseRequest(BaseModel):
+    input: str = Field(..., description="歌单ID或URL")
+
+class PlaylistParseResponse(BaseModel):
+    success: bool
+    playlist_id: Optional[str] = None
+    message: str
+
+class PlaylistDownloadRequest(BaseModel):
+    playlist_id: str = Field(..., description="歌单ID")
+    quality: str = Field(default="128", description="音质: 128/320/flac/mflac")
+    output_dir: Optional[str] = Field(default=None, description="输出目录(默认downloads)")
+
+class PlaylistInfoResponse(BaseModel):
+    success: bool
+    id: str
+    name: str
+    creator: str
+    description: str
+    cover_url: str
+    song_count: int
+    songs: List[Dict]
+
+@app.post("/api/playlist/parse", response_model=PlaylistParseResponse)
+async def parse_playlist_url(request: PlaylistParseRequest):
+    """解析歌单URL，提取歌单ID"""
+    parser = PlaylistParser()
+    playlist_id = parser.parse_qq_playlist_id(request.input)
+    
+    if playlist_id:
+        return PlaylistParseResponse(
+            success=True,
+            playlist_id=playlist_id,
+            message="解析成功"
+        )
+    else:
+        return PlaylistParseResponse(
+            success=False,
+            message="无法解析歌单ID，请检查URL格式"
+        )
+
+@app.get("/api/playlist/{playlist_id}/info")
+async def get_playlist_info_endpoint(playlist_id: str):
+    """获取歌单详细信息"""
+    try:
+        downloader = PlaylistDownloader(credential=state.manager.credential)
+        info = await downloader.get_playlist_info(playlist_id)
+        
+        # 转换歌曲信息为可JSON序列化的格式
+        songs_data = []
+        for song in info.songs:
+            songs_data.append({
+                "name": song.name,
+                "singer": song.singer,
+                "mid": song.mid,
+                "is_vip": song.is_vip,
+                "album_name": song.album_name,
+                "album_mid": song.album_mid
+            })
+        
+        return {
+            "success": True,
+            "id": info.id,
+            "name": info.name,
+            "creator": info.creator,
+            "description": info.description,
+            "cover_url": info.cover_url,
+            "song_count": info.song_count,
+            "songs": songs_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取歌单信息失败: {str(e)}")
+
+@app.post("/api/playlist/download")
+async def download_playlist_endpoint(request: PlaylistDownloadRequest):
+    """开始歌单批量下载（异步任务）"""
+    import uuid
+    
+    task_id = str(uuid.uuid4())
+    output_dir = request.output_dir or DOWNLOAD_DIR
+    
+    # 存储任务信息（简化版，实际可用Redis等）
+    if not hasattr(state, 'download_tasks'):
+        state.download_tasks = {}
+    
+    state.download_tasks[task_id] = {
+        "id": task_id,
+        "playlist_id": request.playlist_id,
+        "status": "pending",
+        "progress": 0,
+        "total": 0,
+        "current_song": "",
+        "result": None
+    }
+    
+    # 启动后台任务
+    async def do_download():
+        try:
+            state.download_tasks[task_id]["status"] = "running"
+            
+            def progress_callback(current, total, song_name, status):
+                state.download_tasks[task_id].update({
+                    "progress": current,
+                    "total": total,
+                    "current_song": song_name,
+                    "current_status": status
+                })
+            
+            downloader = PlaylistDownloader(credential=state.manager.credential)
+            result = await downloader.download_playlist(
+                playlist_id=request.playlist_id,
+                output_dir=Path(output_dir),
+                quality=request.quality,
+                progress_callback=progress_callback
+            )
+            
+            state.download_tasks[task_id].update({
+                "status": "completed",
+                "result": result
+            })
+            
+        except Exception as e:
+            state.download_tasks[task_id].update({
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    # 启动后台任务
+    asyncio.create_task(do_download())
+    
+    return {
+        "success": True,
+        "task_id": task_id,
+        "message": "下载任务已启动"
+    }
+
+@app.get("/api/playlist/download/{task_id}/status")
+async def get_download_status(task_id: str):
+    """获取下载任务状态"""
+    if not hasattr(state, 'download_tasks') or task_id not in state.download_tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = state.download_tasks[task_id]
+    return {
+        "id": task["id"],
+        "status": task["status"],
+        "progress": task.get("progress", 0),
+        "total": task.get("total", 0),
+        "current_song": task.get("current_song", ""),
+        "current_status": task.get("current_status", ""),
+        "result": task.get("result"),
+        "error": task.get("error")
+    }
+
+@app.get("/api/playlist/download/stream")
+async def download_playlist_stream(playlist_id: str, quality: str = "128"):
+    """SSE流式下载进度（用于前端实时显示）"""
+    from fastapi.responses import StreamingResponse
+    
+    async def event_generator():
+        downloader = StreamingPlaylistDownloader(credential=state.manager.credential)
+        output_dir = Path(DOWNLOAD_DIR)
+        
+        async for event in downloader.download_with_streaming(
+            playlist_id=playlist_id,
+            output_dir=output_dir,
+            quality=quality
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+            
+            # 给客户端喘息时间
+            await asyncio.sleep(0.1)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+class AntiDetectionSettings(BaseModel):
+    min_delay: float = Field(default=1.5, ge=0.5, le=10.0)
+    max_delay: float = Field(default=4.0, ge=1.0, le=30.0)
+    batch_size: int = Field(default=3, ge=1, le=10)
+    batch_interval: float = Field(default=8.0, ge=1.0, le=60.0)
+    max_concurrent: int = Field(default=2, ge=1, le=5)
+
+@app.get("/api/playlist/settings")
+async def get_anti_detection_settings():
+    """获取反检测配置"""
+    return {
+        "min_delay": AntiDetectionConfig.MIN_DELAY,
+        "max_delay": AntiDetectionConfig.MAX_DELAY,
+        "batch_size": AntiDetectionConfig.BATCH_SIZE,
+        "batch_interval": AntiDetectionConfig.BATCH_INTERVAL,
+        "max_concurrent": AntiDetectionConfig.MAX_CONCURRENT
+    }
+
+@app.post("/api/playlist/settings")
+async def update_anti_detection_settings(settings: AntiDetectionSettings):
+    """更新反检测配置"""
+    AntiDetectionConfig.MIN_DELAY = settings.min_delay
+    AntiDetectionConfig.MAX_DELAY = settings.max_delay
+    AntiDetectionConfig.BATCH_SIZE = settings.batch_size
+    AntiDetectionConfig.BATCH_INTERVAL = settings.batch_interval
+    AntiDetectionConfig.MAX_CONCURRENT = settings.max_concurrent
+    
+    return {
+        "success": True,
+        "message": "设置已更新"
+    }
+
+# ==================== End Playlist Endpoints ====================
 
 # Serve static files (Frontend)
 from fastapi.staticfiles import StaticFiles
