@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
-from typing import Optional
+from typing import Optional, List, Dict
 import base64
 from io import BytesIO
 import uvicorn
@@ -11,6 +11,8 @@ import uuid
 import os
 import mimetypes
 import re
+import json
+from pathlib import Path
 
 # Import from existing modules
 import sys
@@ -39,12 +41,29 @@ print("Creating state...", file=sys.stderr)
 state = GlobalState()
 print("State created", file=sys.stderr)
 
+_zip_cleanup_task = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     state.manager.load_credential()
+
+    async def _periodic_zip_cleanup():
+        while True:
+            try:
+                _cleanup_old_zip_sessions()
+            except Exception as e:
+                print(f"[zip-cleanup] periodic cleanup error: {e}", file=sys.stderr)
+            await asyncio.sleep(300)  # every 5 minutes
+
+    global _zip_cleanup_task
+    _zip_cleanup_task = asyncio.create_task(_periodic_zip_cleanup())
+
     yield
+
     # Shutdown
+    if _zip_cleanup_task:
+        _zip_cleanup_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -240,6 +259,10 @@ from fastapi import Request
 import tempfile
 from urllib.parse import quote
 from mutagen import File as MutagenFile
+import zipfile
+import shutil
+import time
+from datetime import datetime
 
 # Password management
 CONFIG_DIR = os.getenv("CONFIG_DIR", ".")
@@ -343,6 +366,11 @@ async def change_password(
 DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", os.path.join(os.path.dirname(__file__), "downloads"))
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# Temporary zip staging for browser chunk downloads
+PLAYLIST_ZIP_TTL_SECONDS = 2 * 60 * 60  # 2 hours
+PLAYLIST_ZIP_ROOT = os.path.join(tempfile.gettempdir(), "qq_playlist_zip_chunks")
+os.makedirs(PLAYLIST_ZIP_ROOT, exist_ok=True)
+
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".aac", ".wav", ".ogg", ".opus"}
 
 
@@ -351,16 +379,20 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"[\s\-_.,，。·:：()（）\[\]【】]+", "", (value or "").lower())
 
 
-def _safe_rel_to_abs(rel_path: str) -> str:
+def _safe_rel_to_abs_under_base(rel_path: str, base_dir: str) -> str:
     if not rel_path:
         raise HTTPException(status_code=400, detail="path is required")
-    base = os.path.realpath(DOWNLOAD_DIR)
+    base = os.path.realpath(base_dir)
     target = os.path.realpath(os.path.join(base, rel_path))
     if not target.startswith(base + os.sep) and target != base:
         raise HTTPException(status_code=400, detail="invalid path")
     if not os.path.isfile(target):
         raise HTTPException(status_code=404, detail="file not found")
     return target
+
+
+def _safe_rel_to_abs(rel_path: str) -> str:
+    return _safe_rel_to_abs_under_base(rel_path, DOWNLOAD_DIR)
 
 
 def _extract_lyrics(audio) -> str:
@@ -445,14 +477,14 @@ def _extract_audio_info(abs_path: str, rel_path: str):
     return info
 
 
-def _iter_audio_files():
-    for root, _, files in os.walk(DOWNLOAD_DIR):
+def _iter_audio_files(base_dir: str = DOWNLOAD_DIR):
+    for root, _, files in os.walk(base_dir):
         for filename in files:
             ext = os.path.splitext(filename)[1].lower()
             if ext not in AUDIO_EXTENSIONS:
                 continue
             abs_path = os.path.join(root, filename)
-            rel_path = os.path.relpath(abs_path, DOWNLOAD_DIR)
+            rel_path = os.path.relpath(abs_path, base_dir)
             yield abs_path, rel_path
 
 
@@ -588,85 +620,170 @@ async def download_library_file(path: str):
         },
     )
 
+
+@app.get("/api/batch-files")
+async def list_batch_files(q: str = "", limit: int = 500):
+    """
+    List temporary browser-batch files under /tmp/qq_playlist_zip_chunks.
+    Includes both zipped chunks and staged audio files.
+    """
+    _cleanup_old_zip_sessions()
+    limit = max(1, min(limit, 2000))
+    q_raw = (q or "").strip().lower()
+    q_norm = _normalize_text(q)
+
+    files = []
+    for root, _, filenames in os.walk(PLAYLIST_ZIP_ROOT):
+        for filename in filenames:
+            abs_path = os.path.join(root, filename)
+            rel_path = os.path.relpath(abs_path, PLAYLIST_ZIP_ROOT)
+            name_raw = filename.lower()
+            name_norm = _normalize_text(filename)
+            if q_raw and q_raw not in name_raw and (not q_norm or q_norm not in name_norm):
+                continue
+            try:
+                st = os.stat(abs_path)
+                files.append({
+                    "name": filename,
+                    "path": rel_path,
+                    "size": st.st_size,
+                    "mtime": int(st.st_mtime),
+                })
+            except FileNotFoundError:
+                continue
+
+    files.sort(key=lambda x: x["mtime"], reverse=True)
+    return {
+        "list": files[:limit],
+        "total": len(files),
+        "ttlSeconds": PLAYLIST_ZIP_TTL_SECONDS,
+        "root": PLAYLIST_ZIP_ROOT,
+    }
+
+
+@app.get("/api/batch-files/download")
+async def download_batch_file(path: str):
+    _cleanup_old_zip_sessions()
+    abs_path = _safe_rel_to_abs_under_base(path, PLAYLIST_ZIP_ROOT)
+    filename = os.path.basename(abs_path)
+    return FileResponse(
+        abs_path,
+        media_type=_guess_media_type(abs_path),
+        filename=filename,
+        headers={
+            "Accept-Ranges": "bytes",
+        },
+    )
+
 class SaveRequest(BaseModel):
     mid: str
     quality: str = "flac"
-    
-@app.post("/api/save")
-async def save_song(req: SaveRequest):
-    """
-    Download song to server filesystem and auto-tag it.
-    Useful for Docker volume mounting.
-    """
-    print(f"Saving song to server: {req.mid}, quality={req.quality}", file=sys.stderr)
-    try:
-        # 1. Get song URL
-        credential = state.manager.credential
-        
-        file_type = SongFileType.MP3_128
-        file_ext = ".mp3"
-        if req.quality == "320":
-            file_type = SongFileType.MP3_320
-            file_ext = ".mp3"
-        elif req.quality == "flac":
-            file_type = SongFileType.FLAC
-            file_ext = ".flac"
-        elif req.quality == "mflac":
-            file_type = SongFileType.MASTER
-            file_ext = ".flac"
-            
-        urls_map = await get_song_urls([req.mid], file_type=file_type, credential=credential)
-        song_url = urls_map.get(req.mid, "")
-        
-        if not song_url:
-            raise HTTPException(status_code=404, detail="Song URL not found")
+    auto_tag: bool = True
 
-        # 2. Get Metadata & Lyrics for tagging
-        from auto_tag import get_song_detail, auto_tag_song
-        metadata = await get_song_detail(req.mid)
-        
-        lyrics_text = ""
+
+class PlaylistBulkDownloadRequest(BaseModel):
+    mids: List[str]
+    quality: str = "flac"
+    auto_tag: bool = True
+    playlist_name: str = "playlist"
+
+
+class PlaylistChunkPrepareRequest(BaseModel):
+    mids: List[str]
+    quality: str = "flac"
+    auto_tag: bool = True
+    playlist_name: str = "playlist"
+    chunk_size: int = 5
+
+
+async def _download_song_to_dir(mid: str, quality: str, auto_tag: bool, output_dir: str):
+    """Core save logic reused by /api/save and playlist bulk zip."""
+    # 1. Get song URL
+    credential = state.manager.credential
+
+    file_type = SongFileType.MP3_128
+    file_ext = ".mp3"
+    if quality == "320":
+        file_type = SongFileType.MP3_320
+        file_ext = ".mp3"
+    elif quality == "flac":
+        file_type = SongFileType.FLAC
+        file_ext = ".flac"
+    elif quality == "mflac":
+        file_type = SongFileType.MASTER
+        file_ext = ".flac"
+
+    urls_map = await get_song_urls([mid], file_type=file_type, credential=credential)
+    song_url = urls_map.get(mid, "")
+
+    if not song_url:
+        raise HTTPException(status_code=404, detail="Song URL not found")
+
+    # 2. Get Metadata & Lyrics for tagging (optional)
+    from auto_tag import get_song_detail, auto_tag_song
+    metadata = await get_song_detail(mid)
+
+    lyrics_text = ""
+    if auto_tag:
         try:
-            lyrics_data = await get_lyric(req.mid)
+            lyrics_data = await get_lyric(mid)
             lyrics_text = lyrics_data.get("lyric", "")
         except:
             pass
 
-        # 3. Determine Filename
-        # Match client-side format: Title_Singer_Album.ext
-        if metadata:
-            safe_title = "".join(c for c in metadata.get("title", "") if c.isalnum() or c in " -_").strip()
-            safe_artist = "".join(c for c in metadata.get("artist", "") if c.isalnum() or c in " -_,").strip()
-            safe_album = "".join(c for c in metadata.get("album", "") if c.isalnum() or c in " -_").strip()
-            
-            # Fallback if empty
-            if not safe_artist: safe_artist = "Unknown"
-            if not safe_album: safe_album = "Unknown"
-            
-            filename = f"{safe_title}_{safe_artist}_{safe_album}{file_ext}"
-        else:
-            filename = f"{req.mid}{file_ext}"
-            
-        file_path = os.path.join(DOWNLOAD_DIR, filename)
-        
-        # 4. Download file
-        download_headers = {
-            "Referer": "https://y.qq.com/",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(song_url, headers=download_headers) as response:
-                if response.status != 200:
-                    raise HTTPException(status_code=500, detail=f"Download failed: HTTP {response.status}")
-                
-                with open(file_path, "wb") as f:
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        f.write(chunk)
-                        
-        # 5. Apply Tags
-        tag_result = await auto_tag_song(file_path, req.mid, lyrics_text)
-        
+    # 3. Determine Filename
+    if metadata:
+        safe_title = "".join(c for c in metadata.get("title", "") if c.isalnum() or c in " -_").strip()
+        safe_artist = "".join(c for c in metadata.get("artist", "") if c.isalnum() or c in " -_,").strip()
+        safe_album = "".join(c for c in metadata.get("album", "") if c.isalnum() or c in " -_").strip()
+
+        if not safe_artist:
+            safe_artist = "Unknown"
+        if not safe_album:
+            safe_album = "Unknown"
+
+        filename = f"{safe_title}_{safe_artist}_{safe_album}{file_ext}"
+    else:
+        filename = f"{mid}{file_ext}"
+
+    os.makedirs(output_dir, exist_ok=True)
+    file_path = os.path.join(output_dir, filename)
+
+    # 4. Download file
+    download_headers = {
+        "Referer": "https://y.qq.com/",
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(song_url, headers=download_headers) as response:
+            if response.status != 200:
+                raise HTTPException(status_code=500, detail=f"Download failed: HTTP {response.status}")
+
+            with open(file_path, "wb") as f:
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    f.write(chunk)
+
+    # 5. Apply Tags (optional)
+    tag_result = {"success": False, "reason": "disabled"}
+    if auto_tag:
+        tag_result = await auto_tag_song(file_path, mid, lyrics_text)
+
+    return file_path, filename, tag_result
+
+
+@app.post("/api/save")
+async def save_song(req: SaveRequest):
+    """
+    Download song to server filesystem and optional auto-tag.
+    Useful for Docker volume mounting.
+    """
+    print(f"Saving song to server: {req.mid}, quality={req.quality}, auto_tag={req.auto_tag}", file=sys.stderr)
+    try:
+        file_path, filename, tag_result = await _download_song_to_dir(
+            req.mid, req.quality, req.auto_tag, DOWNLOAD_DIR
+        )
+
         return {
             "success": True,
             "filePath": file_path,
@@ -681,6 +798,411 @@ async def save_song(req: SaveRequest):
         import traceback
         traceback.print_exc(file=sys.stderr)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _safe_zip_name(name: str) -> str:
+    return "".join(c for c in (name or "playlist") if c.isalnum() or c in " -_").strip() or "playlist"
+
+
+def _session_paths(session_id: str):
+    base = os.path.join(PLAYLIST_ZIP_ROOT, session_id)
+    songs = os.path.join(base, "songs")
+    chunks = os.path.join(base, "chunks")
+    manifest = os.path.join(base, "manifest.json")
+    return base, songs, chunks, manifest
+
+
+def _cleanup_old_zip_sessions():
+    now = time.time()
+    removed = 0
+    try:
+        for name in os.listdir(PLAYLIST_ZIP_ROOT):
+            path = os.path.join(PLAYLIST_ZIP_ROOT, name)
+            if not os.path.isdir(path):
+                continue
+            age = now - os.path.getmtime(path)
+            if age > PLAYLIST_ZIP_TTL_SECONDS:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+                print(f"[zip-cleanup] removed expired session: {path} (age={int(age)}s)", file=sys.stderr)
+    except Exception as e:
+        print(f"[zip-cleanup] cleanup failed: {e}", file=sys.stderr)
+    if removed > 0:
+        print(f"[zip-cleanup] removed {removed} expired session(s)", file=sys.stderr)
+
+
+async def _prepare_playlist_chunks_internal(req: PlaylistChunkPrepareRequest, progress_cb=None):
+    _cleanup_old_zip_sessions()
+
+    mids = [m for m in req.mids if m]
+    if not mids:
+        raise HTTPException(status_code=400, detail="mids is empty")
+
+    chunk_size = max(1, min(20, int(req.chunk_size or 5)))
+    session_id = f"zip_{int(time.time())}_{os.getpid()}_{len(mids)}"
+    base, songs_dir, chunks_dir, manifest_path = _session_paths(session_id)
+    os.makedirs(songs_dir, exist_ok=True)
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    # Download all files first to staging dir
+    ok_files = []
+    failed = 0
+    total = len(mids)
+    for idx, mid in enumerate(mids, start=1):
+        if progress_cb:
+            progress_cb({
+                "status": "running",
+                "stage": "downloading",
+                "download_current": idx - 1,
+                "download_total": total,
+                "zip_current": 0,
+                "zip_total": 0,
+                "current_mid": mid,
+                "message": f"downloading {idx}/{total}"
+            })
+        try:
+            file_path, filename, _ = await _download_song_to_dir(mid, req.quality, req.auto_tag, songs_dir)
+            ok_files.append((file_path, filename))
+        except Exception as e:
+            failed += 1
+            print(f"[playlist chunks] failed mid={mid}: {e}", file=sys.stderr)
+
+        if progress_cb:
+            progress_cb({
+                "status": "running",
+                "stage": "downloading",
+                "download_current": idx,
+                "download_total": total,
+                "zip_current": 0,
+                "zip_total": 0,
+                "current_mid": mid,
+                "message": f"downloaded {idx}/{total}"
+            })
+
+    if not ok_files:
+        shutil.rmtree(base, ignore_errors=True)
+        raise HTTPException(status_code=500, detail="No songs downloaded successfully")
+
+    # Create chunk zips
+    safe_name = _safe_zip_name(req.playlist_name)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    chunks = []
+    total_chunks = (len(ok_files) + chunk_size - 1) // chunk_size
+
+    for i in range(total_chunks):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, len(ok_files))
+        part = ok_files[start:end]
+        zip_name = f"{safe_name}_{stamp}_part{i+1:02d}-of-{total_chunks:02d}.zip"
+        zip_path = os.path.join(chunks_dir, zip_name)
+
+        if progress_cb:
+            progress_cb({
+                "status": "running",
+                "stage": "compressing",
+                "download_current": total,
+                "download_total": total,
+                "zip_current": i,
+                "zip_total": total_chunks,
+                "message": f"compressing part {i+1}/{total_chunks}"
+            })
+
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for abs_fp, fn in part:
+                zf.write(abs_fp, fn)
+
+        chunks.append({
+            "index": i + 1,
+            "count": len(part),
+            "zipName": zip_name,
+            "downloadUrl": f"/api/playlist/browser-chunks/{session_id}/{i+1}"
+        })
+
+        if progress_cb:
+            progress_cb({
+                "status": "running",
+                "stage": "compressing",
+                "download_current": total,
+                "download_total": total,
+                "zip_current": i + 1,
+                "zip_total": total_chunks,
+                "message": f"compressed part {i+1}/{total_chunks}"
+            })
+
+    manifest = {
+        "sessionId": session_id,
+        "expiresInSeconds": PLAYLIST_ZIP_TTL_SECONDS,
+        "expiresAt": int(time.time()) + PLAYLIST_ZIP_TTL_SECONDS,
+        "playlistName": safe_name,
+        "chunkSize": chunk_size,
+        "totalRequested": len(mids),
+        "totalSuccess": len(ok_files),
+        "totalFailed": failed,
+        "chunks": chunks,
+    }
+
+    import json as _json
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        _json.dump(manifest, f, ensure_ascii=False)
+
+    return manifest
+
+
+@app.post("/api/playlist/browser-chunks/prepare")
+async def prepare_playlist_browser_chunks(req: PlaylistChunkPrepareRequest):
+    """Sync prepare endpoint (legacy)."""
+    return await _prepare_playlist_chunks_internal(req)
+
+
+# In-memory async task status for browser chunk preparation
+PLAYLIST_PREP_TASKS = {}
+
+
+def _write_partial_manifest(session_id: str, playlist_name: str, chunk_size: int, total_requested: int, total_success: int, total_failed: int, chunks: list[dict]):
+    base, _, _, manifest_path = _session_paths(session_id)
+    manifest = {
+        "sessionId": session_id,
+        "expiresInSeconds": PLAYLIST_ZIP_TTL_SECONDS,
+        "expiresAt": int(time.time()) + PLAYLIST_ZIP_TTL_SECONDS,
+        "playlistName": playlist_name,
+        "chunkSize": chunk_size,
+        "totalRequested": total_requested,
+        "totalSuccess": total_success,
+        "totalFailed": total_failed,
+        "chunks": chunks,
+    }
+    import json as _json
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        _json.dump(manifest, f, ensure_ascii=False)
+    return manifest
+
+
+def _zip_chunk_sync(zip_path: str, files: list[tuple[str, str]]):
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for abs_fp, fn in files:
+            zf.write(abs_fp, fn)
+
+
+@app.post("/api/playlist/browser-chunks/prepare-async")
+async def prepare_playlist_browser_chunks_async(req: PlaylistChunkPrepareRequest):
+    _cleanup_old_zip_sessions()
+
+    mids = [m for m in (req.mids or []) if m]
+    if not mids:
+        raise HTTPException(status_code=400, detail="mids is empty")
+
+    chunk_size = max(1, min(20, int(req.chunk_size or 5)))
+    session_id = f"zip_{int(time.time())}_{os.getpid()}_{len(mids)}"
+    task_id = f"prep_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    base, songs_dir, chunks_dir, _ = _session_paths(session_id)
+    os.makedirs(songs_dir, exist_ok=True)
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    zip_total_planned = (len(mids) + chunk_size - 1) // chunk_size
+
+    PLAYLIST_PREP_TASKS[task_id] = {
+        "status": "running",
+        "stage": "queued",
+        "sessionId": session_id,
+        "download_current": 0,
+        "download_total": len(mids),
+        "zip_current": 0,
+        "zip_total": zip_total_planned,
+        "ready_chunks": [],
+        "message": "queued",
+    }
+
+    async def _runner():
+        safe_name = _safe_zip_name(req.playlist_name)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        ok_count = 0
+        failed_count = 0
+        ready_chunks: list[dict] = []
+        pending_zip_tasks: list[tuple[int, int, str, asyncio.Task]] = []
+        buffer_files: list[tuple[str, str]] = []
+
+        async def _flush_completed_zip_tasks():
+            nonlocal pending_zip_tasks, ready_chunks
+            still_pending = []
+            for idx, cnt, zip_name, t in pending_zip_tasks:
+                if t.done():
+                    err = t.exception()
+                    if err is not None:
+                        print(f"zip chunk failed idx={idx}: {err}", file=sys.stderr)
+                        continue
+                    chunk = {
+                        "index": idx,
+                        "count": cnt,
+                        "zipName": zip_name,
+                        "downloadUrl": f"/api/playlist/browser-chunks/{session_id}/{idx}"
+                    }
+                    ready_chunks.append(chunk)
+                else:
+                    still_pending.append((idx, cnt, zip_name, t))
+            pending_zip_tasks = still_pending
+
+        try:
+            PLAYLIST_PREP_TASKS[task_id].update({"stage": "downloading", "message": "downloading"})
+
+            for i, mid in enumerate(mids, start=1):
+                PLAYLIST_PREP_TASKS[task_id].update({
+                    "stage": "downloading",
+                    "download_current": i - 1,
+                    "message": f"downloading {i}/{len(mids)}",
+                    "zip_current": len(ready_chunks),
+                    "ready_chunks": sorted(ready_chunks, key=lambda x: x["index"])
+                })
+
+                try:
+                    file_path, filename, _ = await _download_song_to_dir(mid, req.quality, req.auto_tag, songs_dir)
+                    ok_count += 1
+                    buffer_files.append((file_path, filename))
+                except Exception as e:
+                    failed_count += 1
+                    print(f"[playlist async] failed mid={mid}: {e}", file=sys.stderr)
+
+                PLAYLIST_PREP_TASKS[task_id].update({
+                    "download_current": i,
+                    "message": f"downloaded {i}/{len(mids)}",
+                })
+
+                # Once chunk buffer is full, start compression immediately in background
+                if len(buffer_files) >= chunk_size:
+                    chunk_idx = len(ready_chunks) + len(pending_zip_tasks) + 1
+                    zip_name = f"{safe_name}_{stamp}_part{chunk_idx:02d}-of-{zip_total_planned:02d}.zip"
+                    zip_path = os.path.join(chunks_dir, zip_name)
+                    files_for_chunk = buffer_files[:]
+                    buffer_files = []
+
+                    t = asyncio.create_task(asyncio.to_thread(_zip_chunk_sync, zip_path, files_for_chunk))
+                    pending_zip_tasks.append((chunk_idx, len(files_for_chunk), zip_name, t))
+                    PLAYLIST_PREP_TASKS[task_id].update({
+                        "stage": "compressing",
+                        "message": f"compressing chunk {chunk_idx}/{zip_total_planned}"
+                    })
+
+                # continuously publish completed chunks while still downloading next songs
+                await _flush_completed_zip_tasks()
+                manifest = _write_partial_manifest(
+                    session_id=session_id,
+                    playlist_name=safe_name,
+                    chunk_size=chunk_size,
+                    total_requested=len(mids),
+                    total_success=ok_count,
+                    total_failed=failed_count,
+                    chunks=sorted(ready_chunks, key=lambda x: x["index"]),
+                )
+                PLAYLIST_PREP_TASKS[task_id].update({
+                    "ready_chunks": sorted(ready_chunks, key=lambda x: x["index"]),
+                    "manifest": manifest,
+                    "zip_current": len(ready_chunks),
+                })
+
+            # handle leftover files as final chunk
+            if buffer_files:
+                chunk_idx = len(ready_chunks) + len(pending_zip_tasks) + 1
+                zip_name = f"{safe_name}_{stamp}_part{chunk_idx:02d}-of-{zip_total_planned:02d}.zip"
+                zip_path = os.path.join(chunks_dir, zip_name)
+                t = asyncio.create_task(asyncio.to_thread(_zip_chunk_sync, zip_path, buffer_files[:]))
+                pending_zip_tasks.append((chunk_idx, len(buffer_files), zip_name, t))
+                buffer_files = []
+
+            # Wait for remaining compressions, but keep emitting progress
+            while pending_zip_tasks:
+                PLAYLIST_PREP_TASKS[task_id].update({
+                    "stage": "compressing",
+                    "message": f"compressing {len(pending_zip_tasks)} chunk(s)"
+                })
+                await asyncio.sleep(0.2)
+                await _flush_completed_zip_tasks()
+                manifest = _write_partial_manifest(
+                    session_id=session_id,
+                    playlist_name=safe_name,
+                    chunk_size=chunk_size,
+                    total_requested=len(mids),
+                    total_success=ok_count,
+                    total_failed=failed_count,
+                    chunks=sorted(ready_chunks, key=lambda x: x["index"]),
+                )
+                PLAYLIST_PREP_TASKS[task_id].update({
+                    "ready_chunks": sorted(ready_chunks, key=lambda x: x["index"]),
+                    "manifest": manifest,
+                    "zip_current": len(ready_chunks),
+                })
+
+            final_manifest = _write_partial_manifest(
+                session_id=session_id,
+                playlist_name=safe_name,
+                chunk_size=chunk_size,
+                total_requested=len(mids),
+                total_success=ok_count,
+                total_failed=failed_count,
+                chunks=sorted(ready_chunks, key=lambda x: x["index"]),
+            )
+
+            PLAYLIST_PREP_TASKS[task_id].update({
+                "status": "completed",
+                "stage": "ready",
+                "manifest": final_manifest,
+                "ready_chunks": sorted(ready_chunks, key=lambda x: x["index"]),
+                "zip_current": len(ready_chunks),
+                "zip_total": len(ready_chunks),
+                "message": "ready"
+            })
+        except Exception as e:
+            PLAYLIST_PREP_TASKS[task_id].update({
+                "status": "failed",
+                "stage": "failed",
+                "error": str(e),
+                "message": str(e)
+            })
+
+    asyncio.create_task(_runner())
+    return {"taskId": task_id, "sessionId": session_id}
+
+@app.get("/api/playlist/browser-chunks/task/{task_id}")
+async def get_playlist_browser_chunks_task(task_id: str):
+    task = PLAYLIST_PREP_TASKS.get(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
+@app.get("/api/playlist/browser-chunks/{session_id}/{chunk_index}")
+async def download_playlist_browser_chunk(session_id: str, chunk_index: int, background_tasks: BackgroundTasks):
+    _cleanup_old_zip_sessions()
+    base, _, chunks_dir, manifest_path = _session_paths(session_id)
+    if not os.path.exists(manifest_path):
+        raise HTTPException(status_code=404, detail="session not found or expired")
+
+    import json as _json
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = _json.load(f)
+
+    chunks = manifest.get("chunks", [])
+    target = next((c for c in chunks if c.get("index") == chunk_index), None)
+    if not target:
+        raise HTTPException(status_code=404, detail="chunk not found")
+
+    zip_name = target["zipName"]
+    zip_path = os.path.join(chunks_dir, zip_name)
+    if not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="chunk file missing")
+
+    # touch session dir mtime on access
+    os.utime(base, None)
+
+    return FileResponse(
+        zip_path,
+        media_type="application/zip",
+        filename=zip_name,
+        headers={
+            "X-Playlist-Chunk-Index": str(chunk_index),
+            "X-Playlist-Chunk-Count": str(len(chunks)),
+            "X-Playlist-Chunk-Expires-In": str(PLAYLIST_ZIP_TTL_SECONDS),
+        }
+    )
 
 @app.get("/api/proxy")
 async def proxy_stream(
@@ -811,6 +1333,234 @@ async def proxy_stream(
         status_code=status_code
     )
 
+
+# ==================== Playlist Download Endpoints ====================
+
+from pydantic import BaseModel, Field
+from typing import Literal
+from playlist import (
+    PlaylistParser, 
+    PlaylistDownloader, 
+    StreamingPlaylistDownloader,
+    download_qq_playlist,
+    AntiDetectionConfig
+)
+
+class PlaylistParseRequest(BaseModel):
+    input: str = Field(..., description="歌单ID或URL")
+
+class PlaylistParseResponse(BaseModel):
+    success: bool
+    playlist_id: Optional[str] = None
+    message: str
+
+class PlaylistDownloadRequest(BaseModel):
+    playlist_id: str = Field(..., description="歌单ID")
+    quality: str = Field(default="128", description="音质: 128/320/flac/mflac")
+    output_dir: Optional[str] = Field(default=None, description="输出目录(默认downloads)")
+
+class PlaylistInfoResponse(BaseModel):
+    success: bool
+    id: str
+    name: str
+    creator: str
+    description: str
+    cover_url: str
+    song_count: int
+    songs: List[Dict]
+
+@app.post("/api/playlist/parse", response_model=PlaylistParseResponse)
+async def parse_playlist_url(request: PlaylistParseRequest):
+    """解析歌单URL，提取歌单ID"""
+    parser = PlaylistParser()
+    playlist_id = parser.parse_qq_playlist_id(request.input)
+    
+    if playlist_id:
+        return PlaylistParseResponse(
+            success=True,
+            playlist_id=playlist_id,
+            message="解析成功"
+        )
+    else:
+        return PlaylistParseResponse(
+            success=False,
+            message="无法解析歌单ID，请检查URL格式"
+        )
+
+@app.get("/api/playlist/{playlist_id}/info")
+async def get_playlist_info_endpoint(playlist_id: str):
+    """获取歌单详细信息"""
+    try:
+        downloader = PlaylistDownloader(credential=state.manager.credential)
+        info = await downloader.get_playlist_info(playlist_id)
+        
+        # 转换歌曲信息为可JSON序列化的格式
+        songs_data = []
+        for song in info.songs:
+            songs_data.append({
+                "name": song.name,
+                "singer": song.singer,
+                "mid": song.mid,
+                "is_vip": song.is_vip,
+                "album_name": song.album_name,
+                "album_mid": song.album_mid
+            })
+        
+        return {
+            "success": True,
+            "id": info.id,
+            "name": info.name,
+            "creator": info.creator,
+            "description": info.description,
+            "cover_url": info.cover_url,
+            "song_count": info.song_count,
+            "songs": songs_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取歌单信息失败: {str(e)}")
+
+@app.post("/api/playlist/download")
+async def download_playlist_endpoint(request: PlaylistDownloadRequest):
+    """开始歌单批量下载（异步任务）"""
+    import uuid
+    
+    task_id = str(uuid.uuid4())
+    output_dir = request.output_dir or DOWNLOAD_DIR
+    
+    # 存储任务信息（简化版，实际可用Redis等）
+    if not hasattr(state, 'download_tasks'):
+        state.download_tasks = {}
+    
+    state.download_tasks[task_id] = {
+        "id": task_id,
+        "playlist_id": request.playlist_id,
+        "status": "pending",
+        "progress": 0,
+        "total": 0,
+        "current_song": "",
+        "result": None
+    }
+    
+    # 启动后台任务
+    async def do_download():
+        try:
+            state.download_tasks[task_id]["status"] = "running"
+            
+            def progress_callback(current, total, song_name, status):
+                state.download_tasks[task_id].update({
+                    "progress": current,
+                    "total": total,
+                    "current_song": song_name,
+                    "current_status": status
+                })
+            
+            downloader = PlaylistDownloader(credential=state.manager.credential)
+            result = await downloader.download_playlist(
+                playlist_id=request.playlist_id,
+                output_dir=Path(output_dir),
+                quality=request.quality,
+                progress_callback=progress_callback
+            )
+            
+            state.download_tasks[task_id].update({
+                "status": "completed",
+                "result": result
+            })
+            
+        except Exception as e:
+            state.download_tasks[task_id].update({
+                "status": "failed",
+                "error": str(e)
+            })
+    
+    # 启动后台任务
+    asyncio.create_task(do_download())
+    
+    return {
+        "success": True,
+        "task_id": task_id,
+        "message": "下载任务已启动"
+    }
+
+@app.get("/api/playlist/download/{task_id}/status")
+async def get_download_status(task_id: str):
+    """获取下载任务状态"""
+    if not hasattr(state, 'download_tasks') or task_id not in state.download_tasks:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    
+    task = state.download_tasks[task_id]
+    return {
+        "id": task["id"],
+        "status": task["status"],
+        "progress": task.get("progress", 0),
+        "total": task.get("total", 0),
+        "current_song": task.get("current_song", ""),
+        "current_status": task.get("current_status", ""),
+        "result": task.get("result"),
+        "error": task.get("error")
+    }
+
+@app.get("/api/playlist/download/stream")
+async def download_playlist_stream(playlist_id: str, quality: str = "128"):
+    """SSE流式下载进度（用于前端实时显示）"""
+    from fastapi.responses import StreamingResponse
+    
+    async def event_generator():
+        downloader = StreamingPlaylistDownloader(credential=state.manager.credential)
+        output_dir = Path(DOWNLOAD_DIR)
+        
+        async for event in downloader.download_with_streaming(
+            playlist_id=playlist_id,
+            output_dir=output_dir,
+            quality=quality
+        ):
+            yield f"data: {json.dumps(event)}\n\n"
+            
+            # 给客户端喘息时间
+            await asyncio.sleep(0.1)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+class AntiDetectionSettings(BaseModel):
+    min_delay: float = Field(default=1.5, ge=0.5, le=10.0)
+    max_delay: float = Field(default=4.0, ge=1.0, le=30.0)
+    batch_size: int = Field(default=3, ge=1, le=10)
+    batch_interval: float = Field(default=8.0, ge=1.0, le=60.0)
+    max_concurrent: int = Field(default=2, ge=1, le=5)
+
+@app.get("/api/playlist/settings")
+async def get_anti_detection_settings():
+    """获取反检测配置"""
+    return {
+        "min_delay": AntiDetectionConfig.MIN_DELAY,
+        "max_delay": AntiDetectionConfig.MAX_DELAY,
+        "batch_size": AntiDetectionConfig.BATCH_SIZE,
+        "batch_interval": AntiDetectionConfig.BATCH_INTERVAL,
+        "max_concurrent": AntiDetectionConfig.MAX_CONCURRENT
+    }
+
+@app.post("/api/playlist/settings")
+async def update_anti_detection_settings(settings: AntiDetectionSettings):
+    """更新反检测配置"""
+    AntiDetectionConfig.MIN_DELAY = settings.min_delay
+    AntiDetectionConfig.MAX_DELAY = settings.max_delay
+    AntiDetectionConfig.BATCH_SIZE = settings.batch_size
+    AntiDetectionConfig.BATCH_INTERVAL = settings.batch_interval
+    AntiDetectionConfig.MAX_CONCURRENT = settings.max_concurrent
+    
+    return {
+        "success": True,
+        "message": "设置已更新"
+    }
+
+# ==================== End Playlist Endpoints ====================
 
 # Serve static files (Frontend)
 from fastapi.staticfiles import StaticFiles

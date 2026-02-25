@@ -48,6 +48,35 @@ interface SearchPanelProps {
     API_BASE: string;
 }
 
+interface PlaylistInfo {
+    id: string;
+    name: string;
+    creator: string;
+    song_count: number;
+    songs: SearchResult[];
+}
+
+interface PlaylistTaskStatus {
+    status: string;
+    progress: number;
+    total: number;
+    current_song?: string;
+    current_status?: string;
+    stage?: string;
+    download_current?: number;
+    download_total?: number;
+    zip_current?: number;
+    zip_total?: number;
+    message?: string;
+    result?: {
+        success?: number;
+        failed?: number;
+        skipped?: number;
+        output_dir?: string;
+    };
+    error?: string;
+}
+
 export function SearchPanel({ API_BASE }: SearchPanelProps) {
     const [keyword, setKeyword] = useState('');
     const [allResults, setAllResults] = useState<SearchResult[]>([]);
@@ -73,6 +102,18 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
     const isSeekingRef = useRef(false);
     const [sliderValue, setSliderValue] = useState(0);
     const lyricContainerRef = useRef<HTMLDivElement>(null);
+
+    // Playlist states
+    const [playlistInput, setPlaylistInput] = useState('');
+    const [playlistInfo, setPlaylistInfo] = useState<PlaylistInfo | null>(null);
+    const [playlistLoading, setPlaylistLoading] = useState(false);
+    const [playlistTaskId, setPlaylistTaskId] = useState<string | null>(null);
+    const [playlistTaskStatus, setPlaylistTaskStatus] = useState<PlaylistTaskStatus | null>(null);
+    const [playlistError, setPlaylistError] = useState('');
+    const [playlistPage, setPlaylistPage] = useState(1);
+    const [playlistDownloadTarget, setPlaylistDownloadTarget] = useState<'browser' | 'server'>('browser');
+    const [playlistQuality, setPlaylistQuality] = useState('flac');
+    const [playlistAutoTag, setPlaylistAutoTag] = useState(true);
 
     // Persist autoTag to localStorage
     useEffect(() => {
@@ -330,7 +371,8 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     mid: song.mid,
-                    quality: quality
+                    quality: quality,
+                    auto_tag: autoTag,
                 })
             });
             const result = await res.json();
@@ -345,6 +387,352 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             alert("Failed to save song to server.");
         } finally {
             setSavingMid(null);
+        }
+    };
+
+    const playlistDownloadSong = async (e: React.MouseEvent, song: SearchResult) => {
+        e.stopPropagation();
+        setDownloadingMid(song.mid);
+        try {
+            if (song.localPath) {
+                const dlRes = await fetch(`${API_BASE}/api/library/download?path=${encodeURIComponent(song.localPath)}`);
+                if (!dlRes.ok) throw new Error(`Local download failed: HTTP ${dlRes.status}`);
+                const blob = await dlRes.blob();
+                const blobUrl = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.href = blobUrl;
+                link.download = song.localPath.split('/').pop() || `${song.title}.flac`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(blobUrl);
+                return;
+            }
+
+            const res = await fetch(`${API_BASE}/api/song/${song.mid}?quality=${playlistQuality}`);
+            const data = await res.json();
+            if (!data.url) {
+                alert("Download failed: URL not available.");
+                return;
+            }
+
+            const ext = playlistQuality === 'flac' || playlistQuality === 'mflac' ? 'flac' : 'mp3';
+            const singerName = song.singer?.[0]?.name || 'Unknown';
+            const albumName = song.album?.name || 'Unknown';
+            const filename = `${song.title}_${singerName}_${albumName}.${ext}`;
+
+            let proxyUrl = `${API_BASE}/api/proxy?url=${encodeURIComponent(data.url)}&download=true&name=${encodeURIComponent(filename)}`;
+            if (playlistAutoTag) {
+                proxyUrl += `&mid=${song.mid}&autoTag=true`;
+            }
+
+            const link = document.createElement('a');
+            link.href = proxyUrl;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (error) {
+            console.error(error);
+            alert(`Failed to download song: ${error instanceof Error ? error.message : "Unknown error"}`);
+        } finally {
+            setDownloadingMid(null);
+        }
+    };
+
+    const playlistSaveToServer = async (e: React.MouseEvent, song: SearchResult) => {
+        e.stopPropagation();
+        setSavingMid(song.mid);
+        try {
+            const res = await fetch(`${API_BASE}/api/save`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    mid: song.mid,
+                    quality: playlistQuality,
+                    auto_tag: playlistAutoTag,
+                })
+            });
+            const result = await res.json();
+            if (result.success) {
+                alert(`✅ Saved to Server: ${result.fileName}\nPath: ${result.filePath}`);
+            } else {
+                alert(`❌ Save failed: ${result.detail || 'Unknown error'}`);
+            }
+        } catch (error) {
+            console.error(error);
+            alert("Failed to save song to server.");
+        } finally {
+            setSavingMid(null);
+        }
+    };
+
+    const parsePlaylist = async () => {
+        if (!playlistInput.trim()) return;
+        setPlaylistLoading(true);
+        setPlaylistError('');
+        setPlaylistInfo(null);
+        setPlaylistTaskId(null);
+        setPlaylistTaskStatus(null);
+        try {
+            const parseRes = await fetch(`${API_BASE}/api/playlist/parse`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ input: playlistInput.trim() })
+            });
+            const parseData = await parseRes.json();
+            if (!parseRes.ok || !parseData.success || !parseData.playlist_id) {
+                setPlaylistError(parseData?.message || '无法解析歌单链接');
+                return;
+            }
+
+            const infoRes = await fetch(`${API_BASE}/api/playlist/${parseData.playlist_id}/info`);
+            const infoData = await infoRes.json();
+            if (!infoRes.ok || !infoData.success) {
+                setPlaylistError(infoData?.detail || '获取歌单信息失败');
+                return;
+            }
+
+            const songsRaw = infoData.songs || [];
+            const adaptedSongs: SearchResult[] = songsRaw.map((s: any) => ({
+                mid: s.mid,
+                title: s.name,
+                singer: [{ name: s.singer || 'Unknown' }],
+                album: { name: s.album_name || 'Unknown', mid: '' },
+                interval: 0,
+            }));
+            const withLocal = await annotateLocalMatches(adaptedSongs);
+
+            setPlaylistInfo({
+                id: infoData.id,
+                name: infoData.name,
+                creator: infoData.creator,
+                song_count: infoData.song_count,
+                songs: withLocal,
+            });
+            setPlaylistPage(1);
+        } catch (e) {
+            console.error(e);
+            setPlaylistError('请求失败，请检查后端状态');
+        } finally {
+            setPlaylistLoading(false);
+        }
+    };
+
+    const startPlaylistDownload = async () => {
+        if (!playlistInfo?.id) return;
+        setPlaylistLoading(true);
+        setPlaylistError('');
+        setPlaylistTaskStatus(null);
+        try {
+            const midsToDownload = (playlistInfo.songs || []).map(s => s.mid);
+
+            if (!midsToDownload.length) {
+                setPlaylistError('歌单无可下载歌曲');
+                return;
+            }
+
+            // 浏览器下载：按 5 首/包 打 zip，逐包弹出下载（显示下载+压缩双状态）
+            if (playlistDownloadTarget === 'browser') {
+                setPlaylistTaskStatus({
+                    status: 'running',
+                    progress: 0,
+                    total: midsToDownload.length,
+                    stage: 'queued',
+                    current_status: '排队中'
+                });
+
+                const prepStartRes = await fetch(`${API_BASE}/api/playlist/browser-chunks/prepare-async`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        mids: midsToDownload,
+                        quality: playlistQuality,
+                        auto_tag: playlistAutoTag,
+                        playlist_name: playlistInfo.name,
+                        chunk_size: 5,
+                    })
+                });
+                const prepStartData = await prepStartRes.json();
+                if (!prepStartRes.ok || !prepStartData?.taskId) {
+                    throw new Error(prepStartData?.detail || '分包准备启动失败');
+                }
+
+                const prepTaskId = prepStartData.taskId as string;
+
+                const delivered = new Set<number>();
+                let finalManifest: any = null;
+                let deliveredSongs = 0;
+
+                for (let poll = 0; poll < 1200; poll++) { // up to ~20 minutes
+                    const stRes = await fetch(`${API_BASE}/api/playlist/browser-chunks/task/${prepTaskId}`);
+                    const st = await stRes.json();
+
+                    if (!stRes.ok) throw new Error(st?.detail || '获取分包状态失败');
+
+                    const downloadCurrent = Number(st.download_current || 0);
+                    const downloadTotal = Number(st.download_total || midsToDownload.length);
+                    const zipCurrent = Number(st.zip_current || 0);
+                    const zipTotal = Number(st.zip_total || 0);
+                    const stage = st.stage || 'running';
+                    const readyChunks = (st.ready_chunks || st.manifest?.chunks || []) as any[];
+
+                    // deliver new ready chunks immediately (while backend may still be downloading/compressing)
+                    const newChunks = readyChunks
+                        .filter(c => !delivered.has(Number(c.index)))
+                        .sort((a, b) => Number(a.index) - Number(b.index));
+
+                    for (const chunk of newChunks) {
+                        const href = `${API_BASE}${chunk.downloadUrl}`;
+                        const a = document.createElement('a');
+                        a.href = href;
+                        a.download = chunk.zipName || `playlist_part_${chunk.index}.zip`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        delivered.add(Number(chunk.index));
+                        deliveredSongs += Number(chunk.count || 0);
+
+                        setPlaylistTaskStatus({
+                            status: 'running',
+                            progress: downloadCurrent,
+                            total: downloadTotal,
+                            stage: 'delivering',
+                            download_current: downloadCurrent,
+                            download_total: downloadTotal,
+                            zip_current: zipCurrent,
+                            zip_total: zipTotal,
+                            current_status: `已下发分包 ${delivered.size}/${Math.max(zipTotal, readyChunks.length)}（歌曲约 ${deliveredSongs} 首）`,
+                        });
+
+                        // avoid browser popup blocking
+                        await new Promise(r => setTimeout(r, 500));
+                    }
+
+                    setPlaylistTaskStatus({
+                        status: st.status || 'running',
+                        progress: downloadCurrent,
+                        total: downloadTotal,
+                        stage,
+                        download_current: downloadCurrent,
+                        download_total: downloadTotal,
+                        zip_current: zipCurrent,
+                        zip_total: zipTotal,
+                        current_status: st.message || stage,
+                    });
+
+                    if (st.status === 'completed' && st.manifest) {
+                        finalManifest = st.manifest;
+                        // make sure all chunks have been delivered
+                        const allChunks = (finalManifest.chunks || []) as any[];
+                        const remaining = allChunks
+                            .filter(c => !delivered.has(Number(c.index)))
+                            .sort((a, b) => Number(a.index) - Number(b.index));
+                        for (const chunk of remaining) {
+                            const href = `${API_BASE}${chunk.downloadUrl}`;
+                            const a = document.createElement('a');
+                            a.href = href;
+                            a.download = chunk.zipName || `playlist_part_${chunk.index}.zip`;
+                            document.body.appendChild(a);
+                            a.click();
+                            document.body.removeChild(a);
+                            delivered.add(Number(chunk.index));
+                            deliveredSongs += Number(chunk.count || 0);
+                            await new Promise(r => setTimeout(r, 500));
+                        }
+                        break;
+                    }
+                    if (st.status === 'failed') {
+                        throw new Error(st.error || '分包准备失败');
+                    }
+
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                if (!finalManifest) {
+                    throw new Error('分包准备超时，请重试');
+                }
+
+                setPlaylistTaskStatus({
+                    status: 'completed',
+                    progress: Number(finalManifest.totalSuccess || deliveredSongs),
+                    total: midsToDownload.length,
+                    stage: 'completed',
+                    download_current: Number(finalManifest.totalSuccess || deliveredSongs),
+                    download_total: midsToDownload.length,
+                    zip_current: delivered.size,
+                    zip_total: Number((finalManifest.chunks || []).length || delivered.size),
+                    current_status: '已完成（分包2小时有效）',
+                    result: {
+                        success: Number(finalManifest.totalSuccess || deliveredSongs),
+                        failed: Number(finalManifest.totalFailed || 0),
+                        skipped: 0,
+                    }
+                });
+                return;
+            }
+
+            // 服务器下载：逐首保存到服务器目录
+            const taskId = `bulk-${Date.now()}`;
+            setPlaylistTaskId(taskId);
+            setPlaylistTaskStatus({
+                status: 'running',
+                progress: 0,
+                total: midsToDownload.length,
+                current_song: '',
+                current_status: ''
+            });
+
+            let ok = 0;
+            let failed = 0;
+            for (let i = 0; i < midsToDownload.length; i++) {
+                const mid = midsToDownload[i];
+                const song = (playlistInfo.songs || []).find(s => s.mid === mid);
+                setPlaylistTaskStatus({
+                    status: 'running',
+                    progress: i,
+                    total: midsToDownload.length,
+                    current_song: song ? `${song.title} - ${song.singer?.[0]?.name || 'Unknown'}` : mid,
+                    current_status: 'downloading',
+                });
+
+                try {
+                    const saveRes = await fetch(`${API_BASE}/api/save`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            mid,
+                            quality: playlistQuality,
+                            auto_tag: playlistAutoTag
+                        })
+                    });
+                    if (saveRes.ok) ok += 1;
+                    else failed += 1;
+                } catch (e) {
+                    failed += 1;
+                }
+            }
+
+            setPlaylistTaskStatus({
+                status: 'completed',
+                progress: midsToDownload.length,
+                total: midsToDownload.length,
+                result: {
+                    success: ok,
+                    failed,
+                    skipped: 0,
+                }
+            });
+        } catch (e) {
+            console.error(e);
+            setPlaylistError('启动下载失败');
+            setPlaylistTaskStatus({
+                status: 'failed',
+                progress: 0,
+                total: 0,
+                error: e instanceof Error ? e.message : '批量下载失败'
+            });
+        } finally {
+            setPlaylistLoading(false);
         }
     };
 
@@ -375,6 +763,24 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
             audioRef.current.muted = isMuted;
         }
     }, [isMuted]);
+
+    useEffect(() => {
+        if (!playlistTaskId || playlistTaskId.startsWith('bulk-')) return;
+        const timer = setInterval(async () => {
+            try {
+                const res = await fetch(`${API_BASE}/api/playlist/download/${playlistTaskId}/status`);
+                const data = await res.json();
+                setPlaylistTaskStatus(data);
+                if (data.status === 'completed' || data.status === 'failed') {
+                    clearInterval(timer);
+                }
+            } catch (e) {
+                console.error('poll playlist status failed', e);
+            }
+        }, 1500);
+
+        return () => clearInterval(timer);
+    }, [playlistTaskId, API_BASE]);
 
     // Sync Lyrics
     useEffect(() => {
@@ -421,6 +827,17 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
         const sec = Math.floor(time % 60);
         return `${min}:${sec < 10 ? '0' : ''}${sec}`;
     };
+
+    const playlistPageSize = 5;
+    const playlistSongs = playlistInfo?.songs || [];
+    const playlistTotalPages = Math.max(1, Math.ceil(playlistSongs.length / playlistPageSize));
+    const currentPlaylistSongs = playlistSongs.slice(
+        (playlistPage - 1) * playlistPageSize,
+        playlistPage * playlistPageSize
+    );
+
+    // playlist uses same row actions as search results; no checkbox selection
+
 
     return (
         <div className="flex flex-col h-full w-full max-w-5xl mx-auto">
@@ -469,6 +886,202 @@ export function SearchPanel({ API_BASE }: SearchPanelProps) {
                     <Tag className="w-4 h-4" />
                     <span className="inline text-xs sm:text-sm whitespace-nowrap">Auto-Tag</span>
                 </button>
+            </div>
+
+            {/* Playlist Download Panel */}
+            <div className="mb-6 p-4 bg-black/30 border border-cyan-500/20 rounded-lg">
+                <div className="flex items-center justify-between mb-3">
+                    <h3 className="text-cyan-300 font-mono text-sm tracking-wide">QQ_PLAYLIST_BATCH_DOWNLOAD</h3>
+                    <span className="text-xs text-cyan-700">支持输入歌单链接或ID</span>
+                </div>
+
+                <div className="flex flex-col md:flex-row gap-2">
+                    <input
+                        type="text"
+                        value={playlistInput}
+                        onChange={(e) => setPlaylistInput(e.target.value)}
+                        placeholder="例如: https://y.qq.com/n/ryqq/playlist/8522515502"
+                        className="flex-1 bg-black/40 border border-cyan-500/30 rounded-lg py-2 px-3 text-cyan-100 placeholder:text-cyan-900 focus:outline-none focus:border-cyan-400"
+                    />
+                    <button
+                        onClick={parsePlaylist}
+                        disabled={playlistLoading}
+                        className="px-4 py-2 bg-cyan-900/20 border border-cyan-500/40 text-cyan-300 rounded-lg hover:bg-cyan-500/20 disabled:opacity-50"
+                    >
+                        {playlistLoading ? '解析中...' : '解析歌单'}
+                    </button>
+                </div>
+
+                <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-cyan-300">
+                    <label className="inline-flex items-center gap-2">
+                        <input
+                            type="radio"
+                            name="playlistTarget"
+                            checked={playlistDownloadTarget === 'browser'}
+                            onChange={() => setPlaylistDownloadTarget('browser')}
+                        />
+                        下载到浏览器（每5首一个ZIP，2小时有效）
+                    </label>
+                    <label className="inline-flex items-center gap-2">
+                        <input
+                            type="radio"
+                            name="playlistTarget"
+                            checked={playlistDownloadTarget === 'server'}
+                            onChange={() => setPlaylistDownloadTarget('server')}
+                        />
+                        下载到服务器
+                    </label>
+
+                    <select
+                        value={playlistQuality}
+                        onChange={(e) => setPlaylistQuality(e.target.value)}
+                        className="bg-black/40 border border-cyan-500/30 rounded px-2 py-1 text-cyan-300"
+                    >
+                        <option value="128">歌单128K</option>
+                        <option value="320">歌单320K</option>
+                        <option value="flac">歌单FLAC</option>
+                        <option value="mflac">歌单MASTER</option>
+                    </select>
+
+                    <button
+                        onClick={() => setPlaylistAutoTag(!playlistAutoTag)}
+                        className={`inline-flex items-center gap-1 px-2 py-1 border rounded ${playlistAutoTag
+                            ? 'border-cyan-400 text-cyan-300 bg-cyan-500/10'
+                            : 'border-cyan-700/40 text-cyan-600'
+                            }`}
+                    >
+                        <Tag className="w-3 h-3" />
+                        歌单 Auto-Tag
+                    </button>
+
+                    <button
+                        onClick={startPlaylistDownload}
+                        disabled={!playlistInfo || playlistLoading || (!!playlistTaskId && playlistTaskStatus?.status === 'running')}
+                        className="ml-auto px-4 py-2 bg-green-900/20 border border-green-500/40 text-green-300 rounded-lg hover:bg-green-500/20 disabled:opacity-50"
+                    >
+                        开始批量下载
+                    </button>
+                </div>
+
+                {playlistError && (
+                    <div className="mt-2 text-xs text-red-400">{playlistError}</div>
+                )}
+
+                {playlistInfo && (
+                    <div className="mt-3 p-3 border border-cyan-900/40 rounded bg-black/20 text-sm text-cyan-200 space-y-3">
+                        <div>歌单：<span className="text-cyan-100">{playlistInfo.name}</span></div>
+                        <div>作者：{playlistInfo.creator} · 共 {playlistInfo.song_count} 首</div>
+                        <div className="text-cyan-700 text-xs">ID: {playlistInfo.id}</div>
+
+                        <div className="border border-cyan-900/30 rounded p-2 bg-black/30">
+                            <div className="space-y-2">
+                                {currentPlaylistSongs.map((song) => (
+                                    <div
+                                        key={song.mid}
+                                        className="group flex items-center justify-between p-3 mb-2 bg-black/40 border border-cyan-900/30 rounded hover:bg-cyan-900/20 hover:border-cyan-500/50 transition-all cursor-pointer"
+                                        onClick={() => playSong(song)}
+                                    >
+                                        <div className="flex flex-col overflow-hidden min-w-0 mr-4">
+                                            <span className="text-cyan-100 font-medium truncate group-hover:text-cyan-400 transition-colors">
+                                                {song.title}
+                                            </span>
+                                            <span className="text-xs text-cyan-600 truncate">
+                                                {song.singer?.[0]?.name} · {song.album?.name}{song.localPath ? " · LOCAL" : ""}
+                                            </span>
+                                        </div>
+                                        <div className="flex items-center gap-2 shrink-0">
+                                            <button className="p-2 text-cyan-700 hover:text-cyan-400 transition-colors">
+                                                <Play className="w-4 h-4" />
+                                            </button>
+                                            <button
+                                                className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded border transition-colors ${downloadingMid === song.mid
+                                                    ? 'border-cyan-400 text-cyan-300 bg-cyan-500/10'
+                                                    : 'border-cyan-700/40 text-cyan-500 hover:text-cyan-300 hover:border-cyan-400/70'
+                                                    }`}
+                                                onClick={(e) => playlistDownloadSong(e, song)}
+                                                disabled={downloadingMid === song.mid}
+                                                title="下载到当前设备"
+                                            >
+                                                {downloadingMid === song.mid ? (
+                                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                                ) : (
+                                                    <Download className="w-4 h-4" />
+                                                )}
+                                            </button>
+                                            <button
+                                                className={`inline-flex items-center gap-1 px-2 py-1 text-xs rounded border transition-colors ${savingMid === song.mid
+                                                    ? 'border-green-400 text-green-300 bg-green-500/10'
+                                                    : 'border-cyan-700/40 text-cyan-500 hover:text-green-300 hover:border-green-400/70'
+                                                    }`}
+                                                onClick={(e) => playlistSaveToServer(e, song)}
+                                                disabled={savingMid === song.mid}
+                                                title="下载到服务器"
+                                            >
+                                                {savingMid === song.mid ? (
+                                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                                ) : (
+                                                    <HardDrive className="w-4 h-4" />
+                                                )}
+                                            </button>
+                                        </div>
+                                    </div>
+                                ))}
+                                {currentPlaylistSongs.length === 0 && (
+                                    <div className="text-xs text-cyan-700">当前页无歌曲</div>
+                                )}
+                            </div>
+
+                            <div className="flex items-center justify-center gap-3 mt-3">
+                                <button
+                                    onClick={() => setPlaylistPage(p => Math.max(1, p - 1))}
+                                    disabled={playlistPage <= 1}
+                                    className="px-2 py-1 text-xs border border-cyan-700/40 rounded disabled:opacity-30"
+                                >
+                                    PREV
+                                </button>
+                                <span className="text-xs text-cyan-600">PAGE {playlistPage}/{playlistTotalPages}</span>
+                                <button
+                                    onClick={() => setPlaylistPage(p => Math.min(playlistTotalPages, p + 1))}
+                                    disabled={playlistPage >= playlistTotalPages}
+                                    className="px-2 py-1 text-xs border border-cyan-700/40 rounded disabled:opacity-30"
+                                >
+                                    NEXT
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {playlistTaskStatus && (
+                    <div className="mt-3 p-3 border border-green-900/40 rounded bg-black/20 text-sm space-y-1">
+                        <div className="text-green-300">任务状态：{playlistTaskStatus.status}</div>
+                        <div className="text-cyan-200">
+                            总进度：{playlistTaskStatus.progress || 0}/{playlistTaskStatus.total || 0}
+                            {playlistTaskStatus.current_song ? ` · ${playlistTaskStatus.current_song}` : ''}
+                        </div>
+                        {playlistDownloadTarget === 'browser' && (
+                            <>
+                                <div className="text-cyan-300 text-xs">
+                                    下载阶段：{playlistTaskStatus.download_current || 0}/{playlistTaskStatus.download_total || 0}
+                                </div>
+                                <div className="text-cyan-300 text-xs">
+                                    压缩阶段：{playlistTaskStatus.zip_current || 0}/{playlistTaskStatus.zip_total || 0}
+                                </div>
+                                <div className="text-cyan-500 text-xs">
+                                    当前阶段：{playlistTaskStatus.stage || 'running'} {playlistTaskStatus.current_status ? `· ${playlistTaskStatus.current_status}` : ''}
+                                </div>
+                            </>
+                        )}
+                        {playlistTaskStatus.status === 'completed' && playlistTaskStatus.result && (
+                            <div className="text-xs text-green-200 mt-1">
+                                成功 {playlistTaskStatus.result.success || 0} 首，失败 {playlistTaskStatus.result.failed || 0} 首，跳过 {playlistTaskStatus.result.skipped || 0} 首
+                            </div>
+                        )}
+                        {playlistTaskStatus.error && (
+                            <div className="text-xs text-red-300 mt-1">错误：{playlistTaskStatus.error}</div>
+                        )}
+                    </div>
+                )}
             </div>
 
             {/* Main Content Area: Results + Lyrics Side-by-Side with Unified Height */}

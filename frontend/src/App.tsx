@@ -2,7 +2,8 @@ import { useState, useEffect } from 'react'
 import { LoginView } from './components/LoginView'
 import { SearchPanel } from './components/SearchPanel'
 import { ServerFilesModal } from './components/ServerFilesModal'
-import { Loader2, Terminal, User, RefreshCw, Library } from 'lucide-react'
+import { BatchFilesModal } from './components/BatchFilesModal'
+import { Loader2, Terminal, User, RefreshCw, Library, Archive } from 'lucide-react'
 
 // Define types locally
 interface UserInfo {
@@ -24,6 +25,7 @@ function App() {
   const [changePassMsg, setChangePassMsg] = useState('');
   const [refreshingLibrary, setRefreshingLibrary] = useState(false);
   const [showServerFiles, setShowServerFiles] = useState(false);
+  const [showBatchFiles, setShowBatchFiles] = useState(false);
 
   // Use same origin to avoid cross-port/network issues behind reverse proxy/NAT
   const API_BASE = window.location.origin;
@@ -156,6 +158,14 @@ function App() {
                 >
                   <Library className="w-3 h-3" />
                   <span className="hidden sm:inline">服务器文件</span>
+                </button>
+                <button
+                  onClick={() => setShowBatchFiles(true)}
+                  className="inline-flex items-center gap-1 px-3 py-1 text-xs border border-cyan-700/50 text-cyan-300 rounded-full hover:bg-cyan-900/30 transition-colors"
+                  title="批量下载临时文件"
+                >
+                  <Archive className="w-3 h-3" />
+                  <span className="hidden sm:inline">批量下载文件</span>
                 </button>
                 <button
                   onClick={handleRefreshEmbyLibrary}
@@ -311,6 +321,12 @@ function App() {
       <ServerFilesModal
         open={showServerFiles}
         onClose={() => setShowServerFiles(false)}
+        API_BASE={API_BASE}
+      />
+
+      <BatchFilesModal
+        open={showBatchFiles}
+        onClose={() => setShowBatchFiles(false)}
         API_BASE={API_BASE}
       />
     </div>

@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feat/**
     tags:
       - "v*"
   workflow_dispatch:
@@ -42,7 +43,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=ref,event=branch
             type=sha,prefix=sha-
             type=ref,event=tag
 
