@@ -41,12 +41,29 @@ print("Creating state...", file=sys.stderr)
 state = GlobalState()
 print("State created", file=sys.stderr)
 
+_zip_cleanup_task = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     state.manager.load_credential()
+
+    async def _periodic_zip_cleanup():
+        while True:
+            try:
+                _cleanup_old_zip_sessions()
+            except Exception as e:
+                print(f"[zip-cleanup] periodic cleanup error: {e}", file=sys.stderr)
+            await asyncio.sleep(300)  # every 5 minutes
+
+    global _zip_cleanup_task
+    _zip_cleanup_task = asyncio.create_task(_periodic_zip_cleanup())
+
     yield
+
     # Shutdown
+    if _zip_cleanup_task:
+        _zip_cleanup_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -738,15 +755,21 @@ def _session_paths(session_id: str):
 
 def _cleanup_old_zip_sessions():
     now = time.time()
+    removed = 0
     try:
         for name in os.listdir(PLAYLIST_ZIP_ROOT):
             path = os.path.join(PLAYLIST_ZIP_ROOT, name)
             if not os.path.isdir(path):
                 continue
-            if now - os.path.getmtime(path) > PLAYLIST_ZIP_TTL_SECONDS:
+            age = now - os.path.getmtime(path)
+            if age > PLAYLIST_ZIP_TTL_SECONDS:
                 shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+                print(f"[zip-cleanup] removed expired session: {path} (age={int(age)}s)", file=sys.stderr)
     except Exception as e:
-        print(f"cleanup zip sessions failed: {e}", file=sys.stderr)
+        print(f"[zip-cleanup] cleanup failed: {e}", file=sys.stderr)
+    if removed > 0:
+        print(f"[zip-cleanup] removed {removed} expired session(s)", file=sys.stderr)
 
 
 async def _prepare_playlist_chunks_internal(req: PlaylistChunkPrepareRequest, progress_cb=None):
